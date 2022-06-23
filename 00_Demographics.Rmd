@@ -1,0 +1,213 @@
+---
+title: "assay developement"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+ html_notebook:
+    theme: united
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: true
+subtitle: "__Demographics__"
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics=TRUE, ind=1)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=85),tidy=TRUE, echo=TRUE, warning=FALSE, message=FALSE)
+```
+
+# load packages and datasets
+
+```{r packages}
+rm(list = ls())
+
+# load packages ---------------------------------------------------
+scriptLibraries <-  c(
+ "here",
+ "openxlsx",
+ "tidyverse"
+)
+##---------------------------------------------------------------
+##                      load functions                         --
+##---------------------------------------------------------------
+source("~/r_functions/basicFunctions.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+```
+
+# load data
+
+```{r load}
+columnToDrop <- "X18100281"
+## train
+train <- read.table("./data/quant-ID_VD1_VD2/MxP_Pancreas_Panel_gamma_version_id_data.txt", 
+                    sep = "\t",
+                    header = TRUE)
+train <- train[!train$Diagnosis %in% "Pancreatic cancer and chronic pancreatitis",]
+train$Disease_status <- ifelse(train$PDCA == "yes", "PDAC", "CP")
+train$lowCA <- ifelse(train$CA19_9 < 2, "low", "high")
+train <- train[,!colnames(train) %in% columnToDrop]
+## test
+test <- read.table("./data/quant-ID_VD1_VD2/MxP_Pancreas_Panel_gamma_version_vd1_data.txt", 
+                    sep = "\t",
+                    header = TRUE)
+test$Disease_status <- ifelse(test$PDCA == "yes", "PDAC", "CP")
+test$lowCA <- ifelse(test$CA19_9 < 2, "low", "high")
+test <- test[,!colnames(test) %in% columnToDrop]
+## validation
+validation <- read.table("./data/quant-ID_VD1_VD2/MxP_Pancreas_Panel_gamma_version_vd2_data.tsv", 
+                    sep = "\t",
+                    header = TRUE)
+# validation <- validation[!validation$Diagnosis %in% "Non-pancreatic control",]
+validation$Disease_status <- ifelse(validation$Diagnosis == "Pancreatic cancer", "PDAC", "CP")
+validation$lowCA <- ifelse(validation$CA19_9 < 2, "low", "high")
+validation <- validation[,!colnames(validation) %in% columnToDrop]
+# load metabolite names ---------------------------------------------------
+metaboliteNames <- 
+ read.csv("./masterTable/masterTableMetaboliteNames.csv",
+          stringsAsFactors = FALSE)
+```
+
+## metapac cohort data
+```{r}
+##----------------------------------------------------------------
+##                     load metabolite data                     --
+##----------------------------------------------------------------
+origData <-
+  read.xlsx(
+    "./data/metapac_VD2/ID_VD1_VD2_PLASMA_SERUM_MxP_Metabolomics_Data_2019-08-14_MetaboliteData_MTXH.xlsx",
+    1
+  )
+##----------------------------------------------------------------
+##                      load clinical data                      --
+##----------------------------------------------------------------
+clinData1 <-
+  read.xlsx("./data/metapac_VD2/Clinical_data_ID_VD1_VD2_Status_20170427.xlsx", 
+            )
+
+clinData2 <-
+  read.xlsx("./data/metapac_VD2/Clinical_data_ID_VD1_VD2_Status_20170427.xlsx", 
+            2)
+##---------------------------------------------------------------
+##                     merge clinical data                     --
+##---------------------------------------------------------------
+clinData <-
+  merge(clinData1,
+        clinData2,
+        all = TRUE,
+        by = "OWNER_ID",
+        sort = FALSE)
+##----------------------------------------------------------------
+##                      merge all datasets                      --
+##----------------------------------------------------------------
+expData <-
+  merge(origData,
+        clinData,
+        all = FALSE,
+        by = "ALIQUOT_ID",
+        sort = FALSE)
+##---------------------------------------------------------------
+##                  assign disease categories                  --
+##---------------------------------------------------------------
+expData$Disease_short <-
+  ifelse(
+    expData$DIAGNOSE == "Blutspender",
+    "Control",
+    ifelse(
+      expData$DIAGNOSE == "Control",
+      "Non_pancreatic_control",
+      ifelse(
+        expData$DIAGNOSE == "Leberzirrhose",
+        "Non_pancreatic_control",
+        ifelse(
+          expData$DIAGNOSE == "Non-pancreatic control",
+          "Non_pancreatic_control",
+          ifelse(
+            expData$DIAGNOSE == "Pankreatitis",
+            "CP",
+            ifelse(expData$DIAGNOSE == "CP", "CP", "PDAC")
+          )
+        )
+      )
+    )
+  )
+##---------------------------------------------------------------
+##                    clear corrupt columns                    --
+##---------------------------------------------------------------
+colnames(expData) <- gsub(".x", "", colnames(expData))
+colnames(expData) <- gsub(".y", "", colnames(expData))
+##---------------------------------------------------------------
+##                  delete duplicated columns                  --
+##---------------------------------------------------------------
+expData <- expData[, !duplicated(colnames(expData))]
+##---------------------------------------------------------------
+##                        clear names                          --
+##---------------------------------------------------------------
+dat <- expData %>%
+  janitor::clean_names(case = "none")
+
+## subset for plasma samples
+dat <- dat[dat$MATRIX %in% "Human Plasma",]
+
+## select patients used for modeling
+test$Ext_Reference <- gsub("_21.10.09_Plasma", "", test$Ext_Reference)
+test$Ext_Reference <- gsub("1ml_", "", test$Ext_Reference)
+test$Ext_Reference <- gsub("7.12.11_", "", test$Ext_Reference)
+test$Ext_Reference <- gsub("25.1.11_", "", test$Ext_Reference)
+test$Ext_Reference <- gsub("17.02.09_", "", test$Ext_Reference)
+
+
+
+test$Ext_Reference <- sub(".*?_", "",test$Ext_Reference)
+test$Ext_Reference <- gsub("_.*", "",test$Ext_Reference)
+
+validation$EXTERNAL_REFERENCE <- sub("_[^_]+$", "", validation$EXTERNAL_REFERENCE)
+
+SAMPLE_ID <- c(train$Ext_Reference, test$Ext_Reference, validation$EXTERNAL_REFERENCE)
+
+## subset cohort data for EXT_REFERECES
+dat$MTX_REFERENCE <- gsub("MTXH_08_VD1_", "", dat$MTX_REFERENCE)
+dat.desc <- dat[dat$MTX_REFERENCE %in% SAMPLE_ID,]
+```
+
+## demographics
+```{r}
+colnames(dat.desc) <- toupper(colnames(dat.desc))
+
+demographics <- c("GENDER", "AGE", "CENTER", "BMI", "UICC_TUMOR_CLASSIFICATION",
+                  "DIABETES", "TUMORSIZE", "TUMOR_IN_LYMPHATIC_NODES",
+                  "METASTASES", "TUMOR_GRADING", "CA_19_9", "DISEASE_SHORT",
+                  "PROJECT_PHASE")
+
+dat.desc <- dat.desc[, colnames(dat.desc) %in% demographics]
+
+write.csv(dat.desc, "./data/demographics.csv")
+
+dat.desc <- read.csv("./data/demographics_formated.csv", row.names = NULL)
+
+for (i in colnames(dat.desc)) {
+  print(i)
+  if (i %in% c("CA_19_9", "AGE", "BMI")) {
+    dat.desc[[i]] <- dat.desc[[i]]
+  } else
+    dat.desc[[i]] <- as.factor(dat.desc[[i]])
+}
+
+## project phase
+table <- arsenal::tableby(dat.desc$PROJECT_PHASE ~ ., data = dat.desc)
+table <- as.data.frame(summary(table))
+table[, 1] <- gsub("&nbsp;&nbsp;&nbsp;", "", table[, 1])
+table[, 1] <- gsub("[**]", "", table[, 1])
+knitr::kable(table, "html", booktabs = TRUE, caption = "Demographics and Distribution according to Phases") %>% 
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+        full_width = FALSE)
+```
+
+# computing environment
+
+```{r}
+sessionInfo()
+```

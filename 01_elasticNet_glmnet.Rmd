@@ -1,0 +1,1450 @@
+---
+title: "assay developement"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    theme: united
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: true
+subtitle: "__Elastic Net variable selection__"
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics=TRUE, ind=1)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=85),tidy=TRUE, echo=TRUE, warning=FALSE, message=FALSE)
+```
+
+# load packages and datasets
+
+```{r packages}
+rm(list = ls())
+
+# load packages ---------------------------------------------------
+scriptLibraries <-  c(
+ "glmnet", 
+ "doParallel", 
+ "doMC",
+ "foreach", 
+ "ROCR",
+ "caret",
+ "broom",
+ "scales",
+ "ggplot2",
+ "sjPlot",
+ "here",
+ "pROC",
+ "rstatix"
+)
+##---------------------------------------------------------------
+##                      load functions                         --
+##---------------------------------------------------------------
+source("~/r_functions/basicFunctions.R")
+source("~/r_functions/ImputeTransformScale.R")
+source("~/r_functions/cutOff.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+# ggplot theme --------------------------------------------------
+ggplot_theme <- theme_bw() +
+  theme(
+    axis.line = element_line(size = 0.75),
+    axis.text = element_text(
+      size = 11,
+      face = "bold",
+      colour = "black"
+    ),
+    axis.title = element_text(size = 12, face = "bold")
+  )
+
+```
+
+# load data
+
+```{r load}
+columnToDrop <- "X18100281"
+## train
+train <- read.table("./data/quant-ID_VD1_VD2/MxP_Pancreas_Panel_gamma_version_id_data.txt", 
+                    sep = "\t",
+                    header = TRUE)
+train <- train[!train$Diagnosis %in% "Pancreatic cancer and chronic pancreatitis",]
+train$Disease_status <- ifelse(train$PDCA == "yes", "PDAC", "CP")
+train$lowCA <- ifelse(train$CA19_9 < 2, "low", "high")
+train$lowCA_clinical <- ifelse(train$CA19_9 < 37, "low", "high")
+train <- train[,!colnames(train) %in% columnToDrop]
+
+train$predictionClassCa19.9 <- ifelse(train$CA19_9 < 37,
+                                       "CP", "PDAC")
+## test
+test <- read.table("./data/quant-ID_VD1_VD2/MxP_Pancreas_Panel_gamma_version_vd1_data.txt", 
+                    sep = "\t",
+                    header = TRUE)
+test$Disease_status <- ifelse(test$PDCA == "yes", "PDAC", "CP")
+test$lowCA <- ifelse(test$CA19_9 < 2, "low", "high")
+test$lowCA_clinical <- ifelse(test$CA19_9 < 37, "low", "high")
+test <- test[,!colnames(test) %in% columnToDrop]
+
+test$predictionClassCa19.9 <- ifelse(test$CA19_9 < 37,
+                                       "CP", "PDAC")
+## validation
+validation <- read.table("./data/quant-ID_VD1_VD2/MxP_Pancreas_Panel_gamma_version_vd2_data.tsv", 
+                    sep = "\t",
+                    header = TRUE)
+# validation <- validation[!validation$Diagnosis %in% "Non-pancreatic control",]
+validation$Disease_status <- ifelse(validation$Diagnosis == "Pancreatic cancer", "PDAC", "CP")
+validation$lowCA <- ifelse(validation$CA19_9 < 2, "low", "high")
+validation$lowCA_clinical <- ifelse(validation$CA19_9 < 37, "low", "high")
+validation <- validation[,!colnames(validation) %in% columnToDrop]
+
+validation$predictionClassCa19.9 <- ifelse(validation$CA19_9 < 37,
+                                       "CP", "PDAC")
+# load metabolite names ---------------------------------------------------
+metaboliteNames <- 
+ read.csv("./masterTable/masterTableMetaboliteNames.csv",
+          stringsAsFactors = FALSE)
+```
+
+## create folders
+
+```{r}
+## ml.dataset
+ifelse(!dir.exists(file.path(paste0(here()), "ml_dataset")),
+dir.create(file.path(paste0(here()), "ml_dataset")), FALSE)
+## glmnet.models
+ifelse(!dir.exists(file.path(paste0(here()), "glmnet_models")),
+dir.create(file.path(paste0(here()), "glmnet_models")), FALSE)
+```
+
+## define response and features
+
+```{r response}
+# define response variable -----------------------------------------------
+response <- "Disease_status"
+
+## define train factors
+train[[response]] <- as.factor(train[[response]])
+#train <- train[train$lowCA %in% "high", ]
+## define test factors  
+test[[response]] <- as.factor(test[[response]])
+#test <- test[test$lowCA %in% "high", ]
+## define validation factors
+validation[[response]] <- as.factor(validation[[response]])
+#validation <- validation[validation$lowCA %in% "high", ]
+
+# define features --------------------------------------------------------
+features <-
+ setdiff(colnames(train)[grepl("^X|Disease_status|CA19_9", colnames(train))], response)
+```
+
+## impute missing data and transform data
+
+```{r impute}
+## imupte train
+dropvariables <- colnames(train)[!grepl("^X|CA19_9",colnames(train))]
+ImputedTrain <- ImputeTransformScale(train, 
+                                     Impute= TRUE,
+                                     Transform = TRUE,
+                                     Scaling = TRUE,
+                                     ScaleType = "Auto",
+                                     drop.variables=dropvariables)
+saveRDS(ImputedTrain, "./ml_dataset/ImputedTrain.rds")
+## imupte test
+dropvariables <- colnames(test)[!grepl("^X|CA19_9",colnames(test))]
+ImputedTestComplete <- ImputeTransformScale(test, 
+                                     Impute= TRUE,
+                                     Transform = TRUE,
+                                     Scaling = TRUE,
+                                     ScaleType = "Auto",
+                                     drop.variables=dropvariables)
+saveRDS(ImputedTestComplete, "./ml_dataset/ImputedTest.rds")
+ImputedTest <- ImputedTestComplete[!ImputedTestComplete$Diagnosis %in% "Non-pancreatic control",]
+## imupte Validation
+dropvariables <- colnames(validation)[!grepl("^X|CA19_9",colnames(validation))]
+ImputedValidationComplete <- ImputeTransformScale(validation, 
+                                     Impute= TRUE,
+                                     Transform = TRUE,
+                                     Scaling = TRUE,
+                                     ScaleType = "Auto",
+                                     drop.variables=dropvariables)
+saveRDS(ImputedValidationComplete, "./ml_dataset/ImputedValidation.rds")
+ImputedValidation<- ImputedValidationComplete[!ImputedValidationComplete$Diagnosis %in% "Non-pancreatic control",]
+```
+
+# elastic net
+
+## data preparation
+
+```{r net data}
+## train dataset
+trainX<- as.matrix(ImputedTrain[,colnames(ImputedTrain) %in% features])
+trainXCa19.9 <- as.matrix(cbind(0, CA19_9=ImputedTrain[,colnames(ImputedTrain) %in% "CA19_9"]))
+#trainXCa19.9 <- data.frame(CA19.9_class=as.factor(ifelse(train$CA19_9 <37, "CP", "PDAC")))
+#trainXCa19.9 <- sparse.model.matrix(~.-1, trainXCa19.9)
+trainY <- as.matrix(ImputedTrain[,colnames(ImputedTrain) %in% response])
+
+## test dataset
+testX <- as.matrix(ImputedTest[,colnames(ImputedTest) %in% features])
+testXCa19.9 <- as.matrix(cbind(0, CA19_9=ImputedTest[,colnames(ImputedTest) %in% "CA19_9"]))
+# testXCa19.9 <- data.frame(CA19.9_class=as.factor(ifelse(test[!test$Diagnosis %in% "Non-pancreatic control",]$CA19_9 <37, "CP", "PDAC")))
+# testXCa19.9 <- sparse.model.matrix(~.-1, testXCa19.9)
+testY <- as.matrix(ImputedTest[,colnames(ImputedTest) %in% response])
+
+## validation dataset
+validationX <- as.matrix(ImputedValidation[,colnames(ImputedValidation) %in% features])
+validationXCa19.9 <- as.matrix(cbind(0, CA19_9=ImputedValidation[,colnames(ImputedValidation) %in% "CA19_9"]))
+# validationXCa19.9 <- data.frame(CA19.9_class=as.factor(ifelse(validation[!validation$Diagnosis %in% "Non-pancreatic control",]$CA19_9 <37, "CP", "PDAC")))
+# validationXCa19.9 <- sparse.model.matrix(~.-1, validationXCa19.9)
+validationY <- as.matrix(ImputedValidation[,colnames(ImputedValidation) %in% response])
+
+```
+
+## grid search
+
+```{r grid}
+set.seed(123456789)
+## Elastic net with 0 < alpha < 1
+a <- seq(0.1, 0.9, 0.01)
+
+numberOfCores <- parallel::detectCores(all.tests = TRUE) - 1
+
+## search grid
+if(Sys.info()["sysname"]=="Windows"){
+ cl<-makeCluster(numberOfCores)
+ registerDoParallel(cl)
+}else{
+ registerDoMC(numberOfCores)
+}
+
+if (file.exists("./glmnet_models/mfit.RData")) { load("./glmnet_models/mfit.RData") 
+  } else {
+    search <- foreach(i = a, .combine = rbind) %dopar% {
+      cv <- cv.glmnet(x = trainX,
+                 y = trainY,
+                 family = "binomial",
+                 nfold = 10,
+                 type.measure = "deviance",
+                 parallel = TRUE,
+                 standardize=FALSE,
+                 alpha = i)
+ data.frame(cvm = cv$cvm[cv$lambda == cv$lambda.1se],
+            lambda.1se = cv$lambda.1se,
+            alpha = i)
+}
+## best tuning parameters
+cvIndex <- search[search$cvm == min(search$cvm), ]
+cvIndex
+
+## final model
+mfit <-glmnet(trainX,
+             trainY,
+             family = "binomial",
+             nfold = 10,
+             type.measure = "deviance",
+             parallel = TRUE,
+             standardize=TRUE,
+             alpha = cvIndex$alpha,
+             lambda =  cvIndex$lambda.1se,
+             keep = TRUE)
+# Save model
+save(mfit, file="./glmnet_models/mfit.RData")
+}
+
+## coefficients
+coef <- coef(mfit)
+coefDF <- as.data.frame(as.matrix(coef))
+
+# metabolite ID to metabolite names 
+rownames(coefDF) <- gsub("^X", "", rownames(coefDF))
+matchColumnNames <-
+  match(rownames(coefDF), metaboliteNames$ID, nomatch = 0)
+rownames(coefDF)[rownames(coefDF) %in% metaboliteNames$ID] <-
+  metaboliteNames$METABOLITE_NAME[matchColumnNames]
+colnames(coefDF) <- "coefficient"
+coefDF$varImp <- ifelse(coefDF$coefficient %in% 0, "*", "")
+
+## coef print
+tab_df(coefDF, show.rownames = TRUE, digits = 3)
+
+### CA19.9
+if (file.exists("./glmnet_models/mfitCa19.9.RData")) { load("./glmnet_models/mfitCa19.9.RData") 
+  } else {
+    searchCa199 <- foreach(i = a, .combine = rbind) %dopar% {
+      cv <- cv.glmnet(x = trainXCa19.9,
+                 y = trainY,
+                 family = "binomial",
+                 nfold = 10,
+                 type.measure = "deviance",
+                 parallel = TRUE,
+                 standardize=FALSE,
+                 alpha = i)
+ data.frame(cvm = cv$cvm[cv$lambda == cv$lambda.1se],
+            lambda.1se = cv$lambda.1se,
+            alpha = i)
+}
+## best tuning parameters
+cvIndexCa199 <- searchCa199[searchCa199$cvm == min(searchCa199$cvm), ]
+cvIndexCa199
+
+## final model
+mfitCa19.9 <-glmnet(trainXCa19.9,
+             trainY,
+             family = "binomial",
+             nfold = 10,
+             type.measure = "deviance",
+             parallel = TRUE,
+             standardize=TRUE,
+             alpha = cvIndexCa199$alpha,
+             lambda =  cvIndexCa199$lambda.1se,
+             keep = TRUE)
+
+# Save model
+save(mfitCa19.9, file="./glmnet_models/mfitCa19.9.RData")
+}
+```
+
+## model prediction
+
+```{r pred}
+## train prediction
+ImputedTrain$prediction = predict(mfit, 
+                                  newx = trainX, 
+                                  s = mfit$lambda,
+                                  type="response")
+ImputedTrain$predictionCa19.9 = predict(mfitCa19.9, 
+                                  newx = trainXCa19.9, 
+                                  s = mfitCa19.9$lambda,
+                                  type="response")
+
+## test prediction
+ImputedTest$prediction = predict(mfit, 
+                                  newx = testX, 
+                                  s = mfit$lambda,
+                                  type="response")
+ImputedTest$predictionCa19.9 = predict(mfitCa19.9, 
+                                  newx = testXCa19.9, 
+                                  s = mfitCa19.9$lambda,
+                                  type="response")
+
+## validation prediction
+ImputedValidation$prediction = predict(mfit, 
+                                  newx = validationX, 
+                                  s = mfit$lambda,
+                                  type="response")
+ImputedValidation$predictionCa19.9 = predict(mfitCa19.9, 
+                                  newx = validationXCa19.9, 
+                                  s = mfitCa19.9$lambda,
+                                  type="response")
+```
+
+## cutoff
+
+```{r cutoff}
+accuracy_info <- AccuracyCutoffInfo(train = ImputedTrain, 
+                                    test = ImputedTest,
+                                    predict = "prediction", 
+                                    actual = response,
+                                    PositiveGroup = "PDAC",
+                                    NegativeGroup = "CP")
+# define the theme for the next plot
+p <- accuracy_info$plot
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_accuracy.svg"),
+    fig = p,
+    width = 15,
+    height = 9,
+    dpi = 300
+  )
+```
+
+## roc
+
+```{r roc cost}
+cost_fp <- 1
+cost_fn <- 2
+roc_info <- ROCInfo( data = ImputedTest,
+                     predict = "prediction", 
+                     actual = response, 
+                     cost.fp = cost_fp, 
+                     cost.fn = cost_fn,
+                     PositiveGroup = "PDAC",
+                     NegativeGroup = "CP")
+grid.draw(roc_info$plot)
+
+banner("cutoff")
+print(roc_info$cutoff)
+```
+
+## cutoff based on roc
+
+```{r roc cutoff}
+cm_info <- ConfusionMatrixInfo( data = ImputedTest, 
+                                predict = "prediction", 
+                                actual = response, 
+                                cutoff = roc_info$cutoff,
+                                PositiveGroup = "PDAC",
+                                NegativeGroup = "CP")
+p <- cm_info$plot
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_cutoff.svg"),
+    fig = p,
+    width = 15,
+    height = 9,
+    dpi = 300
+  )
+```
+
+## calculate confusionMatrix
+
+```{r cm}
+#### model
+ImputedTrain$predictionClass <- ifelse(ImputedTrain$prediction < roc_info$cutoff,
+                                       "CP", "PDAC")
+
+ImputedTest$predictionClass <- ifelse(ImputedTest$prediction < roc_info$cutoff,
+                                       "CP", "PDAC")
+
+ImputedValidation$predictionClass <- ifelse(ImputedValidation$prediction < roc_info$cutoff,
+                                            "CP", "PDAC")
+
+banner("train")
+confusionMatrix(ImputedTrain$Disease_status,
+                as.factor(ImputedTrain$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+banner("test")
+confusionMatrix(ImputedTest$Disease_status,
+                as.factor(ImputedTest$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+banner("validation")
+confusionMatrix(ImputedValidation$Disease_status,
+                as.factor(ImputedValidation$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+```
+
+## auc
+
+### function
+
+```{r auc}
+perf.glmnet <- function(truth, pred, predClass, boot.n = 1000, prevalence) {
+  reps <- boot.n
+  predClass <- as.factor(predClass)
+  boot.pred <- matrix(0, nrow = length(truth), ncol = reps)
+  boot.predClass <- matrix(0, nrow = length(truth), ncol = reps)
+  boot.truth <- matrix(0, nrow = length(truth), ncol = reps)
+  for (rep in 1:reps) {
+    bootstrap_indices <- sample(1:length(truth), length(truth), replace = TRUE)
+    boot.pred[, rep] <- pred[bootstrap_indices]
+    boot.predClass[, rep] <- predClass[bootstrap_indices]
+    boot.truth[, rep] <- truth[bootstrap_indices]
+  }
+  
+  pred.obj <- prediction(boot.pred, boot.truth)
+  acc <- performance(pred.obj, measure = "acc")
+  
+  cmResults <- data.frame()
+  
+  for (i in 1:ncol(boot.truth)) {
+    cm <- confusionMatrix(as.factor(boot.truth[,i]), 
+                          as.factor(boot.predClass[,i]), 
+                          prevalence = prevalence)
+    
+    cmResults[i, "accuracy"] = cm$overall['Accuracy']
+    cmResults[i, "specificity"] = cm$byClass["Specificity"]
+    cmResults[i,"sensitivity"] = cm$byClass["Sensitivity"]
+    cmResults[i, "ppv"] = cm$byClass["Pos Pred Value"]
+    cmResults[i, "npv"] = cm$byClass["Neg Pred Value"]
+    
+  }
+  
+  perf <- list(pred = pred, 
+               truth = truth, 
+               roc = performance(pred.obj, measure = "tpr",x.measure = "fpr"), 
+               auc = performance(pred.obj, measure = "auc"), 
+               acc = performance(pred.obj,
+                                 measure = "acc"),
+               cmResults = cmResults
+               )
+  invisible(perf)
+  
+}
+```
+
+### auc 95%CI
+
+```{r}
+banner("model performance train")
+perfTrain <- perf.glmnet(pred = ImputedTrain$prediction, 
+                         truth =ImputedTrain$Disease_status,
+                         predClass = ImputedTrain$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTrain$auc@y.values), ci=.95)
+sapply(perfTrain$cmResults, Rmisc::CI)
+
+
+banner("model performance test")
+perfTest <- perf.glmnet(pred = ImputedTest$prediction, 
+                         truth =ImputedTest$Disease_status,
+                         predClass = ImputedTest$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTest$auc@y.values), ci=.95)
+sapply(perfTest$cmResults, Rmisc::CI)
+
+banner("model performance validation")
+perfValidation <- perf.glmnet(pred = ImputedValidation$prediction, 
+                         truth =ImputedValidation$Disease_status,
+                         predClass = ImputedValidation$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfValidation$auc@y.values), ci=.95)
+sapply(perfValidation$cmResults, Rmisc::CI)
+
+banner("model performance train: Ca19.9")
+perfTrainCa19.9 <- perf.glmnet(pred = ImputedTrain$predictionCa19.9,
+                         truth =ImputedTrain$Disease_status,
+                         predClass = ImputedTrain$predictionClassCa19.9,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTrainCa19.9$auc@y.values), ci=.95)
+sapply(perfTrainCa19.9$cmResults, Rmisc::CI)
+
+
+banner("model performance test")
+perfTestCa19.9 <- perf.glmnet(pred = ImputedTest$predictionCa19.9,
+                         truth = ImputedTest$Disease_status,
+                         predClass = ImputedTest$predictionClassCa19.9,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTestCa19.9$auc@y.values), ci=.95)
+sapply(perfTestCa19.9$cmResults, Rmisc::CI)
+
+banner("model performance validation")
+perfValidationCa19.9 <- perf.glmnet(pred = ImputedValidation$predictionCa19.9,
+                         truth = ImputedValidation$Disease_status,
+                         predClass = ImputedValidation$predictionClassCa19.9,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfValidationCa19.9$auc@y.values), ci=.95)
+sapply(perfValidationCa19.9$cmResults, Rmisc::CI)
+```
+
+## plot roc
+
+```{r roc}
+plotROC <- function(model.list,model.names) {
+  df <- data.frame()
+  auc <- list()
+  for (l in 1:length(model.list)) {
+    perf.roc <- model.list[[l]]$roc
+    perf.avg <- perf.roc
+    alpha.values.list <- unlist(perf.avg@alpha.values)
+    alpha.values.list[mapply(is.infinite, alpha.values.list)] <- 0
+    
+    alpha.values <- rev(seq(min(alpha.values.list),
+                            max(alpha.values.list),
+                            length=max(sapply(perf.avg@alpha.values, length))))
+    for (i in 1:length(perf.avg@y.values)) {
+      perf.avg@x.values[[i]] <-
+        stats::approxfun(perf.avg@alpha.values[[i]],perf.avg@x.values[[i]],
+                         rule=2, ties=mean)(alpha.values)
+      perf.avg@y.values[[i]] <-
+        stats::approxfun(perf.avg@alpha.values[[i]], perf.avg@y.values[[i]],
+                         rule=2, ties=mean)(alpha.values)
+    }
+    
+    x <- c(rowMeans(data.frame(perf.avg@x.values)),0)
+    y <- c(rowMeans(data.frame(perf.avg@y.values)),0)
+    
+    df_unique <- data.frame(fpr=x,
+                            tpr=y,
+                            model=model.names[l])
+    colnames(df_unique) <- c("fpr", "tpr", "model")
+    
+    df <- rbind(df, df_unique)
+    
+    ## auc
+    auc[[model.names[l]]] <- Rmisc::CI(as.numeric(model.list[[l]]$auc@y.values), ci=.95)
+  }
+  
+  col <- RColorBrewer::brewer.pal(length(unique(df$model)), "Set1")
+  plot <- ggplot(df,
+                 aes(x=fpr,
+                     y=tpr,
+                     color=model)) +
+    geom_line(size=2) +
+    theme_bw() +
+    theme(
+      axis.line = element_line(size = 0.75),
+      axis.text = element_text(
+        size = 11,
+        face = "bold",
+        colour = "black"
+      ),
+      axis.title = element_text(size = 12, face = "bold")
+    ) +
+    scale_color_manual(values = col) +
+    theme(legend.position = c(0.8, 0.1),
+          legend.background = element_blank(),
+          legend.text = element_text(size= 12, face="bold"),
+          legend.title = element_blank()) +
+    labs(x="False Positive Rate",
+         y="True Positive Rate")
+}
+
+##----------------------------------------------------------------
+##                        train set (ID)                        --
+##----------------------------------------------------------------
+model.names <- c("Biomarker signature", "CA19.9 alone")
+model.list <- list(perfTrain, perfTrainCa19.9)
+p <- plotROC(model.list, model.names) + ggtitle("train set")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_auc_train.svg"),
+    fig = p,
+    width = 15,
+    height = 15,
+    dpi = 300
+  )
+
+library(pROC)
+
+roc1 <- roc(response = ImputedTrain$Disease_status, 
+            predictor = ImputedTrain$prediction)
+
+roc2 <- roc(response = ImputedTrain$Disease_status, 
+            predictor = ImputedTrain$predictionCa19.9)
+
+roc.test(roc1, roc2,
+               method = "bootstrap", 
+               boot.n = 1000, 
+               progress = "none", 
+               paired = T)
+##----------------------------------------------------------------
+##                        test set (VD1)                        --
+##----------------------------------------------------------------
+model.names <- c("Biomarker signature", "CA19.9 alone")
+model.list <- list(perfTest, perfTestCa19.9)
+p <- plotROC(model.list, model.names) + ggtitle("test set")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_auc_test.svg"),
+    fig = p,
+    width = 15,
+    height = 15,
+    dpi = 300
+  )
+
+roc1 <- roc(response = ImputedTest$Disease_status, 
+            predictor = ImputedTest$prediction)
+
+roc2 <- roc(response = ImputedTest$Disease_status, 
+            predictor = ImputedTest$predictionCa19.9)
+
+roc.test(roc1, roc2,
+               method = "bootstrap", 
+               boot.n = 1000, 
+               progress = "none", 
+               paired = T)
+##----------------------------------------------------------------
+##                   validation set (VD2)                       --
+##----------------------------------------------------------------
+model.names <- c("Biomarker signature", "CA19.9 alone")
+model.list <- list(perfValidation, perfValidationCa19.9)
+p <- plotROC(model.list, model.names) + ggtitle("validation set")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_auc_validation.svg"),
+    fig = p,
+    width = 15,
+    height = 15,
+    dpi = 300
+  )
+
+roc1 <- roc(response = ImputedValidation$Disease_status, 
+            predictor = ImputedValidation$prediction)
+
+roc2 <- roc(response = ImputedValidation$Disease_status, 
+            predictor = ImputedValidation$predictionCa19.9)
+
+roc.test(roc1, roc2,
+               method = "bootstrap", 
+               boot.n = 1000, 
+               progress = "none", 
+               paired = T)
+```
+
+## starburst plot
+
+```{r starburst}
+##----------------------------------------------------------------
+##                        train set (ID)                        --
+##----------------------------------------------------------------
+df <- train
+df$prediction = predict(mfit, 
+                        newx = trainX,
+                        s = mfit$lambda,
+                         type="response")
+df$predictionClass = predict(mfit, 
+                        newx = trainX,
+                        s = mfit$lambda,
+                        type="class")
+df$sig <- ifelse(df$CA19_9 < 37 &
+                   df$prediction >= roc_info$cutoff &
+                   df$Disease_status =="PDAC", 
+                 "Signature(+)CA19.9(-)",
+                 ifelse(df$CA19_9 >= 37 & df$prediction < roc_info$cutoff &
+                   df$Disease_status =="CP", "Signature(-)CA19.9(+)", NA))
+
+p <- ggplot(df, 
+       aes(x=CA19_9,
+           y=prediction,
+           fill=Disease_status)) + 
+  geom_rect(aes(xmin = 0, xmax = 37, ymin = roc_info$cutoff, ymax = Inf), 
+            fill = "gray90", alpha = 0.8) + 
+  geom_rect(aes(xmin = 37, xmax = Inf, ymin = -Inf, ymax = roc_info$cutoff), 
+            fill = "gray90", alpha = 0.8) +
+  geom_point(color="black", 
+             shape=21, size=4, alpha=0.5) +
+  ggplot_theme +
+  geom_hline(yintercept  = roc_info$cutoff) +
+  geom_vline(xintercept = 37) +
+  scale_x_log10() +
+  geom_point(inherit.aes = FALSE,
+    data=subset(df, !is.na(sig)), 
+             aes(x=CA19_9,
+                 y=prediction,
+                 color=sig), 
+             shape=1, 
+             size=6,
+             stroke=1) +
+  scale_fill_manual(values = RColorBrewer::brewer.pal(2, "Set1")) +
+  scale_color_manual(values = RColorBrewer::brewer.pal(2, "Set2")) +
+  labs(x="CA19.9 level [U/ml]", y="Metabolic biomarker signature",
+       shape="Disease status", color="", title = "train set")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_starburst_train.svg"),
+    fig = p,
+    width = 22,
+    height = 15,
+    dpi = 300
+  )
+
+
+##----------------------------------------------------------------
+##                        test set (VD1)                        --
+##----------------------------------------------------------------
+
+df <- test[!test$Diagnosis %in% "Non-pancreatic control",]
+df$prediction = predict(mfit, 
+                        newx = testX,
+                        s = mfit$lambda,
+                         type="response")
+df$predictionClass = predict(mfit, 
+                        newx = testX,
+                        s = mfit$lambda,
+                        type="class")
+df$sig <- ifelse(df$CA19_9 < 37 &
+                   df$prediction >= roc_info$cutoff &
+                   df$Disease_status =="PDAC", 
+                 "Signature(+)CA19.9(-)",
+                 ifelse(df$CA19_9 >= 37 & df$prediction < roc_info$cutoff &
+                   df$Disease_status =="CP", "Signature(-)CA19.9(+)", NA))
+
+p <- ggplot(df, 
+       aes(x=CA19_9,
+           y=prediction,
+           fill=Disease_status)) + 
+  geom_rect(aes(xmin = 0, xmax = 37, ymin = roc_info$cutoff, ymax = Inf), 
+            fill = "gray90", alpha = 0.8) + 
+  geom_rect(aes(xmin = 37, xmax = Inf, ymin = -Inf, ymax = roc_info$cutoff), 
+            fill = "gray90", alpha = 0.8) +
+  geom_point(color="black", 
+             shape=21, size=4, alpha=0.5) +
+  ggplot_theme +
+  geom_hline(yintercept  = roc_info$cutoff) +
+  geom_vline(xintercept = 37) +
+  scale_x_log10() +
+  geom_point(inherit.aes = FALSE,
+    data=subset(df, !is.na(sig)), 
+             aes(x=CA19_9,
+                 y=prediction,
+                 color=sig), 
+             shape=1, 
+             size=6,
+             stroke=1) +
+  scale_fill_manual(values = RColorBrewer::brewer.pal(2, "Set1")) +
+  scale_color_manual(values = RColorBrewer::brewer.pal(2, "Set2")) +
+  labs(x="CA19.9 level [U/ml]", y="Metabolic biomarker signature",
+       shape="Disease status", color="", title = "test set")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_starburst_test.svg"),
+    fig = p,
+    width = 22,
+    height = 15,
+    dpi = 300
+  )
+
+##----------------------------------------------------------------
+##                     validation set (VD2)                     --
+##----------------------------------------------------------------
+
+df <- validation[!validation$Diagnosis %in% "Non-pancreatic control",]
+df$prediction = predict(mfit, 
+                        newx = validationX,
+                        s = mfit$lambda,
+                         type="response")
+df$predictionClass = predict(mfit, 
+                        newx = validationX,
+                        s = mfit$lambda,
+                        type="class")
+df$sig <- ifelse(df$CA19_9 < 37 &
+                   df$prediction >= roc_info$cutoff &
+                   df$Disease_status =="PDAC", 
+                 "Signature(+)CA19.9(-)",
+                 ifelse(df$CA19_9 >= 37 & df$prediction < roc_info$cutoff &
+                   df$Disease_status =="CP", "Signature(-)CA19.9(+)", NA))
+
+p <- ggplot(df, 
+       aes(x=CA19_9,
+           y=prediction,
+           fill=Disease_status)) + 
+  geom_rect(aes(xmin = 0, xmax = 37, ymin = roc_info$cutoff, ymax = Inf), 
+            fill = "gray90", alpha = 0.8) + 
+  geom_rect(aes(xmin = 37, xmax = Inf, ymin = -Inf, ymax = roc_info$cutoff), 
+            fill = "gray90", alpha = 0.8) +
+  geom_point(color="black", 
+             shape=21, size=4, alpha=0.5) +
+  ggplot_theme +
+  geom_hline(yintercept  = roc_info$cutoff) +
+  geom_vline(xintercept = 37) +
+  scale_x_log10() +
+  geom_point(inherit.aes = FALSE,
+    data=subset(df, !is.na(sig)), 
+             aes(x=CA19_9,
+                 y=prediction,
+                 color=sig), 
+             shape=1, 
+             size=6,
+             stroke=1) +
+  scale_fill_manual(values = RColorBrewer::brewer.pal(2, "Set1")) +
+  scale_color_manual(values = RColorBrewer::brewer.pal(2, "Set2")) +
+  labs(x="CA19.9 level [U/ml]", y="Metabolic biomarker signature",
+       shape="Disease status", color="", title = "validation set")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_starburst_validation.svg"),
+    fig = p,
+    width = 22,
+    height = 15,
+    dpi = 300
+  )
+```
+
+## distribution of predictor
+
+```{r dist}
+##----------------------------------------------------------------
+##                        test set (VD1)                        --
+##----------------------------------------------------------------
+testXComplete <- as.matrix(ImputedTestComplete[,colnames(ImputedTestComplete) %in% features])
+df <- test
+df$prediction = predict(mfit, 
+                        newx = testXComplete,
+                        s = mfit$lambda,
+                         type="response")
+
+p <- df %>%
+  mutate(Diagnosis = stringr::str_wrap(Diagnosis, width = 20)) %>%
+ggplot( aes(x=Diagnosis,
+           y=prediction,
+           fill=Diagnosis)) +
+  geom_boxplot(alpha=0.5) +
+  geom_jitter(width = 0.25, color="black", shape =21, show.legend = FALSE) +
+  ggplot_theme +
+  labs(x="", y= "Metabolic biomarker signature score", title= "test set") +
+  geom_hline(yintercept  = roc_info$cutoff) +
+  scale_fill_manual(values= c("#E41A1C","#4DAF4A" ,"#377EB8"))
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_boxplot_test.svg"),
+    fig = p,
+    width = 9,
+    height = 12,
+    dpi = 300
+  )
+
+##----------------------------------------------------------------
+##                        Validation set (VD1)                  --
+##----------------------------------------------------------------
+validationXComplete <- as.matrix(ImputedValidationComplete[,colnames(ImputedValidationComplete) %in% features])
+df <- validation
+df$prediction = predict(mfit, 
+                        newx = validationXComplete,
+                        s = mfit$lambda,
+                         type="response")
+
+stat.test <- df %>%
+  wilcox_test(prediction ~ Diagnosis) %>%
+  rstatix::adjust_pvalue(method="bonferroni") %>%
+  rstatix::add_significance()
+
+stat.test
+
+p <- df %>%
+  mutate(Diagnosis = stringr::str_wrap(Diagnosis, width = 20)) %>%
+ggplot( aes(x=Diagnosis,
+           y=prediction,
+           fill=Diagnosis)) +
+  geom_boxplot(alpha=0.5) +
+  geom_jitter(width = 0.25, color="black", shape =21, show.legend = FALSE) +
+  ggplot_theme +
+  labs(x="", y= "Metabolic biomarker signature score", title= "validation set") +
+  geom_hline(yintercept  = roc_info$cutoff) +
+  scale_fill_manual(values= c("#E41A1C","#4DAF4A" ,"#377EB8"))
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_boxplot_validation.svg"),
+    fig = p,
+    width = 9,
+    height = 12,
+    dpi = 300
+  )
+
+```
+
+## exploratory roc curves
+
+### resectable only
+
+```{r resect}
+##----------------------------------------------------------------
+##                        train set (VD1)                       --
+##----------------------------------------------------------------
+trainResect <- ImputedTrain[!ImputedTrain$resectable == "no",]
+
+perfTrainResect <- perf.glmnet(pred = trainResect$prediction, 
+                         truth =trainResect$Disease_status,
+                         predClass = trainResect$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTrainResect$auc@y.values), ci=.95)
+sapply(perfTrainResect$cmResults, Rmisc::CI)
+
+perfTrainResectCa19.9 <- perf.glmnet(pred = trainResect$predictionCa19.9, 
+                         truth =trainResect$Disease_status,
+                         predClass = trainResect$predictionClassCa19.9,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTrainResectCa19.9$auc@y.values), ci=.95)
+sapply(perfTrainResectCa19.9$cmResults, Rmisc::CI)
+
+model.names <- c("Biomarker signature", "CA19.9 alone")
+model.list <- list(perfTrainResect, perfTrainResectCa19.9)
+
+p <- plotROC(model.list, model.names) + ggtitle("train set: resectable only")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_auc_train_resect.svg"),
+    fig = p,
+    width = 15,
+    height = 15,
+    dpi = 300
+  )
+
+banner("train")
+confusionMatrix(trainResect$Disease_status,
+                as.factor(trainResect$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+
+roc1 <- roc(response = trainResect$Disease_status, 
+            predictor = trainResect$prediction)
+
+roc2 <- roc(response = trainResect$Disease_status, 
+            predictor = trainResect$predictionCa19.9)
+
+roc.test(roc1, roc2,
+               method = "bootstrap", 
+               boot.n = 1000, 
+               progress = "none", 
+               paired = T)
+
+##----------------------------------------------------------------
+##                         test set (VD1)                       --
+##----------------------------------------------------------------
+testResect <- ImputedTest[!ImputedTest$resectable == "no",]
+
+perfTestResect <- perf.glmnet(pred = testResect$prediction, 
+                         truth =testResect$Disease_status,
+                         predClass = testResect$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTestResect$auc@y.values), ci=.95)
+sapply(perfTestResect$cmResults, Rmisc::CI)
+
+perfTestResectCa19.9 <- perf.glmnet(pred = testResect$predictionCa19.9, 
+                         truth =testResect$Disease_status,
+                         predClass = testResect$predictionClassCa19.9,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTestResectCa19.9$auc@y.values), ci=.95)
+sapply(perfTestResectCa19.9$cmResults, Rmisc::CI)
+model.names <- c("Biomarker signature", "CA19.9 alone")
+model.list <- list(perfTestResect, perfTestResectCa19.9)
+
+p <- plotROC(model.list, model.names) + ggtitle("test set: resectable only")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_auc_test_resect.svg"),
+    fig = p,
+    width = 15,
+    height = 15,
+    dpi = 300
+  )
+
+confusionMatrix(testResect$Disease_status,
+                as.factor(testResect$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+
+roc1 <- roc(response = testResect$Disease_status, 
+            predictor = testResect$prediction)
+
+roc2 <- roc(response = testResect$Disease_status, 
+            predictor = testResect$predictionCa19.9)
+
+roc.test(roc1, roc2,
+               method = "bootstrap", 
+               boot.n = 1000, 
+               progress = "none", 
+               paired = T)
+
+##----------------------------------------------------------------
+##                         validation set (VD1)                       --
+##----------------------------------------------------------------
+validationResect <- ImputedValidation[!ImputedValidation$resectable == "no",]
+
+perfValidationResect <- perf.glmnet(pred = validationResect$prediction, 
+                         truth =validationResect$Disease_status,
+                         predClass = validationResect$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfValidationResect$auc@y.values), ci=.95)
+sapply(perfValidationResect$cmResults, Rmisc::CI)
+
+perfValidationResectCa19.9 <- perf.glmnet(pred = validationResect$predictionCa19.9, 
+                         truth =validationResect$Disease_status,
+                         predClass = validationResect$predictionClassCa19.9,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfValidationResectCa19.9$auc@y.values), ci=.95)
+sapply(perfValidationResectCa19.9$cmResults, Rmisc::CI)
+
+model.names <- c("Biomarker signature", "CA19.9 alone")
+model.list <- list(perfValidationResect, perfValidationResectCa19.9)
+
+p <- plotROC(model.list, model.names) + ggtitle("validation set: resectable only")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_auc_validation_resect.svg"),
+    fig = p,
+    width = 15,
+    height = 15,
+    dpi = 300
+  )
+confusionMatrix(validationResect$Disease_status,
+                as.factor(validationResect$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+
+roc1 <- roc(response = validationResect$Disease_status, 
+            predictor = validationResect$prediction)
+
+roc2 <- roc(response = validationResect$Disease_status, 
+            predictor = validationResect$predictionCa19.9)
+
+roc.test(roc1, roc2,
+               method = "bootstrap", 
+               boot.n = 1000, 
+               progress = "none", 
+               paired = T)
+
+```
+
+### detectable CA19.9
+
+```{r ca19.9}
+##----------------------------------------------------------------
+##                        train set (VD1)                       --
+##----------------------------------------------------------------
+trainHighCA <- ImputedTrain[!ImputedTrain$lowCA == "low",]
+
+perfTrainHighCA <- perf.glmnet(pred = trainHighCA$prediction, 
+                         truth =trainHighCA$Disease_status,
+                         predClass = trainHighCA$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTrainHighCA$auc@y.values), ci=.95)
+sapply(perfTrainHighCA$cmResults, Rmisc::CI)
+
+perfTrainHighCACa19.9 <- perf.glmnet(pred = trainHighCA$predictionCa19.9, 
+                         truth =trainHighCA$Disease_status,
+                         predClass = trainHighCA$predictionClassCa19.9,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTrainHighCACa19.9$auc@y.values), ci=.95)
+sapply(perfTrainHighCACa19.9$cmResults, Rmisc::CI)
+
+
+model.names <- c("Biomarker signature", "CA19.9 alone")
+model.list <- list(perfTrainHighCA, perfTrainHighCACa19.9)
+
+p <- plotROC(model.list, model.names) + ggtitle("train set: detectable CA19.9 only (>2 U/ml)")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_auc_train_HighCA.svg"),
+    fig = p,
+    width = 15,
+    height = 15,
+    dpi = 300
+  )
+
+confusionMatrix(trainHighCA$Disease_status,
+                as.factor(trainHighCA$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+
+roc1 <- roc(response = trainHighCA$Disease_status, 
+            predictor = trainHighCA$prediction)
+
+roc2 <- roc(response = trainHighCA$Disease_status, 
+            predictor = trainHighCA$predictionCa19.9)
+
+roc.test(roc1, roc2,
+               method = "bootstrap", 
+               boot.n = 1000, 
+               progress = "none", 
+               paired = T)
+
+##----------------------------------------------------------------
+##                         test set (VD1)                       --
+##----------------------------------------------------------------
+testHighCA <- ImputedTest[!ImputedTest$lowCA == "low",]
+
+perfTestHighCA <- perf.glmnet(pred = testHighCA$prediction, 
+                         truth =testHighCA$Disease_status,
+                         predClass = testHighCA$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTestHighCA$auc@y.values), ci=.95)
+sapply(perfTestHighCA$cmResults, Rmisc::CI)
+
+perfTestHighCACa19.9 <- perf.glmnet(pred = testHighCA$predictionCa19.9, 
+                         truth =testHighCA$Disease_status,
+                         predClass = testHighCA$predictionClassCa19.9,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTestHighCACa19.9$auc@y.values), ci=.95)
+sapply(perfTestHighCACa19.9$cmResults, Rmisc::CI)
+
+
+model.names <- c("Biomarker signature", "CA19.9 alone")
+model.list <- list(perfTestHighCA, perfTestHighCACa19.9)
+
+p <- plotROC(model.list, model.names) + ggtitle("test set: detectable CA19.9 only (>2 U/ml)")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_auc_test_HighCA.svg"),
+    fig = p,
+    width = 15,
+    height = 15,
+    dpi = 300
+  )
+
+confusionMatrix(testHighCA$Disease_status,
+                as.factor(testHighCA$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+
+roc1 <- roc(response = testHighCA$Disease_status, 
+            predictor = testHighCA$prediction)
+
+roc2 <- roc(response = testHighCA$Disease_status, 
+            predictor = testHighCA$predictionCa19.9)
+
+roc.test(roc1, roc2,
+               method = "bootstrap", 
+               boot.n = 1000, 
+               progress = "none", 
+               paired = T)
+##----------------------------------------------------------------
+##                         validation set (VD1)                       --
+##----------------------------------------------------------------
+validationHighCA <- ImputedValidation[!ImputedValidation$lowCA == "low",]
+
+perfValidationHighCA <- perf.glmnet(pred = validationHighCA$prediction, 
+                         truth =validationHighCA$Disease_status,
+                         predClass = validationHighCA$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfValidationHighCA$auc@y.values), ci=.95)
+sapply(perfValidationHighCA$cmResults, Rmisc::CI)
+
+perfValidationHighCACa19.9 <- perf.glmnet(pred = validationHighCA$predictionCa19.9, 
+                         truth =validationHighCA$Disease_status,
+                         predClass = validationHighCA$predictionClassCa19.9,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfValidationHighCACa19.9$auc@y.values), ci=.95)
+sapply(perfValidationHighCACa19.9$cmResults, Rmisc::CI)
+
+model.names <- c("Biomarker signature", "CA19.9 alone")
+model.list <- list(perfValidationHighCA, perfValidationHighCACa19.9)
+
+p <- plotROC(model.list, model.names) + ggtitle("validation set: detectable CA19.9 only (>2 U/ml)")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_auc_validation_HighCA.svg"),
+    fig = p,
+    width = 15,
+    height = 15,
+    dpi = 300
+  )
+
+confusionMatrix(validationHighCA$Disease_status,
+                as.factor(validationHighCA$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+
+roc1 <- roc(response = validationHighCA$Disease_status, 
+            predictor = validationHighCA$prediction)
+
+roc2 <- roc(response = validationHighCA$Disease_status, 
+            predictor = validationHighCA$predictionCa19.9)
+
+roc.test(roc1, roc2,
+               method = "bootstrap", 
+               boot.n = 1000, 
+               progress = "none", 
+               paired = T)
+```
+
+### non clinical CA19.9
+
+```{r ca19.9 clin}
+##----------------------------------------------------------------
+##                        train set (VD1)                       --
+##----------------------------------------------------------------
+trainHighCA <- ImputedTrain[ImputedTrain$lowCA_clinical == "low",]
+
+perfTrainHighCA <- perf.glmnet(pred = trainHighCA$prediction, 
+                         truth =trainHighCA$Disease_status,
+                         predClass = trainHighCA$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTrainHighCA$auc@y.values), ci=.95)
+sapply(perfTrainHighCA$cmResults, Rmisc::CI)
+
+# perfTrainHighCACa19.9 <- perf.glmnet(pred = trainHighCA$predictionCa19.9, 
+#                          truth =trainHighCA$Disease_status,
+#                          predClass = trainHighCA$predictionClassCa19.9,
+#                          prevalence = 1.95/100)
+# banner("AUC and other matrices")
+# Rmisc::CI(as.numeric(perfTrainHighCACa19.9$auc@y.values), ci=.95)
+# sapply(perfTrainHighCACa19.9$cmResults, Rmisc::CI)
+
+
+# model.names <- c("Biomarker signature", "CA19.9 alone")
+# model.list <- list(perfTrainHighCA)
+# 
+# p <- plotROC(model.list, model.names) + ggtitle("train set: detectable CA19.9 only (>2 U/ml)")
+# ## print
+# print(p)
+# ## save results
+# save_plot(
+#     paste0("./svg/glmnet_auc_train_HighCA.svg"),
+#     fig = p,
+#     width = 15,
+#     height = 15,
+#     dpi = 300
+#   )
+
+confusionMatrix(trainHighCA$Disease_status,
+                as.factor(trainHighCA$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+
+roc1 <- roc(response = trainHighCA$Disease_status, 
+            predictor = trainHighCA$prediction)
+
+# roc2 <- roc(response = trainHighCA$Disease_status, 
+#             predictor = trainHighCA$predictionCa19.9)
+
+# roc.test(roc1, roc2,
+#                method = "bootstrap", 
+#                boot.n = 1000, 
+#                progress = "none", 
+#                paired = T)
+
+roc1
+
+##----------------------------------------------------------------
+##                         test set (VD1)                       --
+##----------------------------------------------------------------
+testHighCA <- ImputedTest[!ImputedTest$lowCA_clinical == "low",]
+
+perfTestHighCA <- perf.glmnet(pred = testHighCA$prediction, 
+                         truth =testHighCA$Disease_status,
+                         predClass = testHighCA$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTestHighCA$auc@y.values), ci=.95)
+sapply(perfTestHighCA$cmResults, Rmisc::CI)
+
+# perfTestHighCACa19.9 <- perf.glmnet(pred = testHighCA$predictionCa19.9, 
+#                          truth =testHighCA$Disease_status,
+#                          predClass = testHighCA$predictionClassCa19.9,
+#                          prevalence = 1.95/100)
+# banner("AUC and other matrices")
+# Rmisc::CI(as.numeric(perfTestHighCACa19.9$auc@y.values), ci=.95)
+# sapply(perfTestHighCACa19.9$cmResults, Rmisc::CI)
+# 
+# 
+# model.names <- c("Biomarker signature", "CA19.9 alone")
+# model.list <- list(perfTestHighCA, perfTestHighCACa19.9)
+# 
+# p <- plotROC(model.list, model.names) + ggtitle("test set: detectable CA19.9 only (>2 U/ml)")
+# ## print
+# print(p)
+# ## save results
+# save_plot(
+#     paste0("./svg/glmnet_auc_test_HighCA.svg"),
+#     fig = p,
+#     width = 15,
+#     height = 15,
+#     dpi = 300
+#   )
+
+confusionMatrix(testHighCA$Disease_status,
+                as.factor(testHighCA$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+
+roc1 <- roc(response = testHighCA$Disease_status, 
+            predictor = testHighCA$prediction)
+
+# roc2 <- roc(response = testHighCA$Disease_status, 
+#             predictor = testHighCA$predictionCa19.9)
+# 
+# roc.test(roc1, roc2,
+#                method = "bootstrap", 
+#                boot.n = 1000, 
+#                progress = "none", 
+#                paired = T)
+
+roc1
+##----------------------------------------------------------------
+##                         validation set (VD1)                       --
+##----------------------------------------------------------------
+validationHighCA <- ImputedValidation[!ImputedValidation$lowCA_clinical == "low",]
+
+perfValidationHighCA <- perf.glmnet(pred = validationHighCA$prediction, 
+                         truth =validationHighCA$Disease_status,
+                         predClass = validationHighCA$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfValidationHighCA$auc@y.values), ci=.95)
+sapply(perfValidationHighCA$cmResults, Rmisc::CI)
+
+# perfValidationHighCACa19.9 <- perf.glmnet(pred = validationHighCA$predictionCa19.9, 
+#                          truth =validationHighCA$Disease_status,
+#                          predClass = validationHighCA$predictionClassCa19.9,
+#                          prevalence = 1.95/100)
+# banner("AUC and other matrices")
+# Rmisc::CI(as.numeric(perfValidationHighCACa19.9$auc@y.values), ci=.95)
+# sapply(perfValidationHighCACa19.9$cmResults, Rmisc::CI)
+# 
+# model.names <- c("Biomarker signature", "CA19.9 alone")
+# model.list <- list(perfValidationHighCA, perfValidationHighCACa19.9)
+# 
+# p <- plotROC(model.list, model.names) + ggtitle("validation set: detectable CA19.9 only (>2 U/ml)")
+# ## print
+# print(p)
+# ## save results
+# save_plot(
+#     paste0("./svg/glmnet_auc_validation_HighCA.svg"),
+#     fig = p,
+#     width = 15,
+#     height = 15,
+#     dpi = 300
+#   )
+
+confusionMatrix(validationHighCA$Disease_status,
+                as.factor(validationHighCA$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+
+roc1 <- roc(response = validationHighCA$Disease_status, 
+            predictor = validationHighCA$prediction)
+
+# roc2 <- roc(response = validationHighCA$Disease_status, 
+#             predictor = validationHighCA$predictionCa19.9)
+# 
+# roc.test(roc1, roc2,
+#                method = "bootstrap", 
+#                boot.n = 1000, 
+#                progress = "none", 
+#                paired = T)
+
+roc1
+
+```
+
+# computing environment
+
+```{r}
+sessionInfo()
+```

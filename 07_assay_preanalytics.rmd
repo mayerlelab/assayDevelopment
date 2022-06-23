@@ -1,0 +1,1614 @@
+---
+title: "MetaPac (12 metabolites)"
+subtitle: "__assay development: m-metabolic signature__"
+author: "_umahajan_"
+date:  "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    theme: united
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics=TRUE, ind=1)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=85),
+                      tidy=TRUE, 
+                      echo=TRUE, 
+                      warning=FALSE, 
+                      message=FALSE)
+```
+
+# load packages and datasets
+
+```{r packages}
+rm(list = ls())
+##---------------------------------------------------------------
+##                      required packages                      --
+##---------------------------------------------------------------
+scriptLibraries <-  c(
+  "here",
+  "tidyverse",
+  "stringr",
+  "ggplot2",
+  "ggrepel",
+  "RColorBrewer",
+  "ggpubr",
+  "rstatix",
+  "openxlsx",
+  "pheatmap",
+  "ComplexHeatmap",
+  "sjPlot",
+  "sjmisc",
+  "h2o"
+)
+##---------------------------------------------------------------
+##                      load functions                    --
+##---------------------------------------------------------------
+source("~/r_functions/basicFunctions.R")
+source("~/r_functions/splitViolin.R")
+source("~/r_functions/ImputeTransformScale.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+##----------------------------------------------------------------
+##                         basic themes                         --
+##----------------------------------------------------------------
+ggplot_theme <- theme_bw() +
+  theme(
+    axis.line = element_line(size = 0.75),
+    axis.text = element_text(
+      size = 11,
+      face = "bold",
+      colour = "black"
+    ),
+    axis.title = element_text(size = 12, face = "bold")
+  )
+##---------------------------------------------------------------
+##                    set working directory                    --
+##---------------------------------------------------------------
+here::here()
+# load metabolite names -----------------------------------------
+metaboliteNames <- 
+  read.csv("./masterTable/masterTableMetaboliteNames.csv",
+           stringsAsFactors = FALSE)
+
+## remove additional
+metaboliteNames$METABOLITE_NAME <- gsub("\\ [(]additional:.*", "", 
+                                        metaboliteNames$METABOLITE_NAME)
+
+## signature metabolites ----------------------------------------
+sigMetabolites <- c("X578100402",
+                    "X578100603",
+                    "X578100716", 
+                    "X578100812")
+```
+
+## initiate h2o
+```{r h2o}
+##----------------------------------------------------------------
+##             detect the number of cores available             --
+##----------------------------------------------------------------
+myCores = parallel::detectCores(all.tests = TRUE) - 1
+
+if (myCores > 20) {
+  myCores = 20
+} else
+  myCores = myCores
+
+
+memFreeG = 50
+##----------------------------------------------------------------
+##                         initiate h2o                         --
+##----------------------------------------------------------------
+h2o.init(
+  nthreads = myCores,
+  min_mem_size = paste(memFreeG, "g", sep = ""),
+  max_mem_size = paste(memFreeG, "g", sep = "")
+)
+h2o.no_progress()
+h2o.removeAll()
+
+##----------------------------------------------------------------
+##                        load h2o model                        --
+##----------------------------------------------------------------
+mod.model <- h2o.loadModel(paste0(here(),"/h2o_results/feature_reduction/GLM_1_AutoML_20211203_140114"))
+
+testComplete <- readRDS(paste0(here(),"/ml_dataset/ImputedTest.rds"))
+test <- testComplete[!testComplete$Diagnosis %in% "Non-pancreatic control", ]
+
+test.h2o <- as.h2o(test)
+
+cutoff <- h2o.find_threshold_by_max_metric(h2o.performance(mod.model, test.h2o), "f1")
+```
+
+## keys
+```{r}
+iterations <- 100
+pd <- position_dodge(0.4)
+```
+
+## Influence of spiking (Figure 5A-B)
+
+*Statistical Significance*
+1. From the (up to) 12 replicates measured from each pool, mean, SD, and variance were calculated
+2. This was used to calculate the difference (fold change) between test pool and control pool for each metabolite for each interferent. Statistical significance of this fold change and the confidence interval were calculated
+3. The total allowable error (TAE) is calculated according to the EP7-guidelines, separately for each metabolite and for each interferent. TAE = experimentally determined bias + 3*SD
+4. From the TAE, the acceptable limit Dmax is calculated as proposed by the manufacturer. Dmax =½*TAE 
+5. If the upper confidence limit of the fold change is above the Dmax, the difference is considered clinically significant
+6. The EP7 guidelines do not stipulate for a potential reduction in the metabolite level (fold change < 1), however this is quite important for us: matrix suppression and other effects can reduce the metabolite levels measured
+7. The clinical significance was calculated (for internal use) also employing the negative TEA => TEA = +-(bias + 3SD)
+8. This results in two tolerance limits, Dmax and Dmin
+9. In addition to comparing the upper confidence interval limit to Dmax, a second rule applies: if the lower confidence interval limit is lower than Dmin, the difference between test pool and control pool is considered clinically significant
+10. With this calculation method, there are markedly more significant differences due to the interferents. 
+
+```{r spiking}
+## Plasma dataset
+datPlasma <-
+  openxlsx::read.xlsx(
+    paste0(here(),"/data/Boost_20180627_Metapac_05_Spiking_Global_Profiling_Pancreas_Panel.xlsx"),
+    1
+  ) %>%
+  drop_na(VALUE) %>%
+  mutate(
+    MTX_REFERENCE = sub("_[^_]+$", "", .$MTX_REFERENCE),
+    POOL_TYPE = gsub(" ", ".", .$POOL_TYPE),
+    SPIKING_TYPE = gsub(" ", ".", .$SPIKING_TYPE),
+    VARIABLE = paste(POOL_TYPE, SPIKING_TYPE, sep = "_")
+  )
+
+## define response variable
+responseVariable = "VARIABLE"
+
+## anova loop
+datSubset <- datPlasma
+metabolites <- unique(datSubset$METABOLITE_NAME)
+### empty dataset
+summaryFCPlasma <- data.frame()
+loop <- 1
+## loop
+for (j in metabolites) {
+  datMet <- datSubset[datSubset$METABOLITE_NAME %in% j,] %>%
+    select(INTERFERENT, METABOLITE_NAME, VALUE, VARIABLE) %>%
+    group_by(INTERFERENT, METABOLITE_NAME, VARIABLE) %>%
+    mutate(Id = row_number()) %>%
+    ungroup() %>%
+    spread(METABOLITE_NAME, VALUE, fill = "No") %>%
+    janitor::clean_names()
+  
+  colnames(datMet) <- toupper(colnames(datMet))
+  
+  interferent <- unique(datMet$INTERFERENT)
+  
+  print(paste("---------", j, "---------"))
+  
+  for (k in interferent) {
+    print(k)
+    datInt <- datMet[datMet$INTERFERENT %in% k,]
+    datInt[[toupper(janitor::make_clean_names(j))]] <- 
+      as.numeric(datInt[[toupper(janitor::make_clean_names(j))]])
+    if (length(unique(datInt$VARIABLE)) < 2) {
+      next
+    } else {
+      anovaFormula <-
+        as.formula(paste(
+          toupper(janitor::make_clean_names(j)),
+          "~",
+          responseVariable,
+          sep = ""
+        ))
+      
+      anovaFit <- aov(anovaFormula, data = datInt)
+      
+      tukeyMatrix <- as.matrix(TukeyHSD(anovaFit))
+      
+      tukeyDF <- data.frame(tukeyMatrix[[1]])
+      
+      correctionFDR <-
+        pairwise.t.test(datInt[[toupper(janitor::make_clean_names(j))]],
+                        datInt[[responseVariable]],
+                        p.adjust.method = "BH")
+      
+      correctionFdrDF <- data.frame(correctionFDR[["p.value"]])
+      
+      combinations <- rownames(tukeyMatrix[[1]])
+      
+      for (l in seq_along(combinations)) {
+        groups <- unlist(strsplit(combinations[l], "\\-"))
+        
+        datFC <- datInt[datInt[[responseVariable]] %in% groups, ]
+        
+        datFC <-
+          datFC[, c(responseVariable,
+                    toupper(janitor::make_clean_names(j)))]
+        
+        aggFormula <- as.formula(paste(".", "~", responseVariable))
+        
+        countFC <- aggregate(aggFormula, datFC, mean)
+        
+        summaryFCPlasma[loop, 1] <-
+          paste(groups[1], "=", groups[2], sep = "")
+        
+        summaryFCPlasma[loop, 2] <- j
+        
+        summaryFCPlasma[loop, 3] <-
+          countFC[countFC[[responseVariable]] == groups[1], 2] /
+          countFC[countFC[[responseVariable]] == groups[2], 2]
+        
+        summaryFCPlasma[loop, 4] <-
+          tukeyDF[rownames(tukeyDF) == combinations[l], "p.adj"]
+        
+        summaryFCPlasma[loop, 5] <-
+          correctionFdrDF[rownames(correctionFdrDF) %in% groups[1],
+                          colnames(correctionFdrDF) %in% groups[2]]
+        
+        try(tTest <-
+              t.test(datInt[datInt[[responseVariable]] %in% groups, ][[toupper(janitor::make_clean_names(j))]] ~ datInt[datInt[[responseVariable]] %in% groups, ][[responseVariable]]),
+            silent = TRUE)
+        
+        summaryFCPlasma[loop, 6] <- tTest$statistic
+        
+        summaryFCPlasma[loop, 7] <- k
+        
+        loop <- loop + 1
+      }
+    }
+    
+  }
+  
+}
+## format colnames
+colnames(summaryFCPlasma) <-
+  c("VARIABLE",
+    "METABOLITE_NAME",
+    "logFC",
+    "P_VAL",
+    "FDR",
+    "T_STAT",
+    "INTERFERENT")  
+
+summaryFCPlasma$MATRIX <- "Plasma"
+
+## subset results
+rowSelector <- c("Low.pool_Test.pool=Low.pool_Control.pool",
+                 "High.pool_Test.pool=High.pool_Control.pool")
+subsetSummaryFCPlasma <- summaryFCPlasma[summaryFCPlasma$VARIABLE %in% rowSelector,] %>%
+  mutate(POOL_TYPE = gsub("\\_.*", "", .$VARIABLE)) %>%
+  # filter(FDR < 0.05 & logFC < -0.5 | FDR < 0.05 & logFC > 0.5) %>%
+  select(METABOLITE_NAME, INTERFERENT, MATRIX, POOL_TYPE,logFC, FDR)
+
+
+datPlasma <- datPlasma %>%
+  mutate(MTX_REFERENCE = sub("_[^_]+$", "", .$MTX_REFERENCE)) %>%
+  select(MTX_REFERENCE, INTERFERENT, 
+         POOL_TYPE, SPIKING_TYPE, METABOLITE_NAME,
+         ONTOLOGY1_NAME, ONTOLOGY2_NAME, VALUE) %>%
+  group_by(MTX_REFERENCE, INTERFERENT, 
+           POOL_TYPE, SPIKING_TYPE, METABOLITE_NAME,
+           ONTOLOGY1_NAME, ONTOLOGY2_NAME) %>%
+  add_count() %>%
+  mutate(MEAN = mean(VALUE),
+         SD =sd(VALUE),
+         VARIENCE=var(VALUE), 
+         lowerCI= Rmisc::CI(VALUE)[1],
+         upperCI=Rmisc::CI(VALUE)[3]) %>%
+  ungroup() %>%
+  group_by(INTERFERENT, 
+           POOL_TYPE, SPIKING_TYPE, METABOLITE_NAME) %>%
+  mutate(bias=SimDesign::bias(MEAN, n)) %>%
+  distinct(MEAN,.keep_all=TRUE) %>%
+  mutate(posTAE=bias+2*SD,
+         negTAE=bias-2*SD,
+         Dmax=0.5*posTAE,
+         Dmin=0.5*negTAE) %>%
+  filter(SPIKING_TYPE != "Control.pool") %>%
+  select(METABOLITE_NAME, INTERFERENT, POOL_TYPE, 
+         ONTOLOGY1_NAME, ONTOLOGY2_NAME, Dmax, Dmin, lowerCI, upperCI)
+
+datMergePlasma <- full_join(datPlasma, subsetSummaryFCPlasma,
+                            by = c("METABOLITE_NAME", 
+                                   "INTERFERENT",
+                                   "POOL_TYPE")) %>%
+  filter(FDR < 0.05 & logFC < -2 | FDR < 0.05 & logFC > 2)  %>%
+  filter(Dmax > upperCI | Dmin < lowerCI)
+
+
+## Saline dataset
+datSaline <-
+  openxlsx::read.xlsx(
+    "./data/Boost_20180627_Metapac_05_Spiking_Global_Profiling_Pancreas_Panel.xlsx",
+    2
+  ) %>%
+  drop_na(VALUE) %>%
+  mutate(
+    MTX_REFERENCE = sub("_[^_]+$", "", .$MTX_REFERENCE),
+    POOL_TYPE = gsub(" ", ".", .$POOL_TYPE),
+    SPIKING_TYPE = gsub(" ", ".", .$SPIKING_TYPE),
+    VARIABLE = paste(POOL_TYPE, SPIKING_TYPE, sep = "_")
+  )
+
+## define response variable
+responseVariable = "VARIABLE"
+
+## anova loop
+datSubset <- datSaline
+metabolites <- unique(datSubset$METABOLITE_NAME)
+### empty dataset
+summaryFCSaline <- data.frame()
+loop <- 1
+## loop
+for (j in metabolites) {
+  datMet <- datSubset[datSubset$METABOLITE_NAME %in% j,] %>%
+    select(INTERFERENT, METABOLITE_NAME, VALUE, VARIABLE) %>%
+    group_by(INTERFERENT, METABOLITE_NAME, VARIABLE) %>%
+    mutate(Id = row_number()) %>%
+    ungroup() %>%
+    spread(METABOLITE_NAME, VALUE, fill = "No") %>%
+    janitor::clean_names()
+  
+  colnames(datMet) <- toupper(colnames(datMet))
+  
+  interferent <- unique(datMet$INTERFERENT)
+  
+  print(paste("---------", j, "---------"))
+  
+  for (k in interferent) {
+    print(k)
+    datInt <- datMet[datMet$INTERFERENT %in% k,]
+    datInt[[toupper(janitor::make_clean_names(j))]] <- 
+      as.numeric(datInt[[toupper(janitor::make_clean_names(j))]])
+    if (length(unique(datInt$VARIABLE)) < 2) {
+      next
+    } else{
+      anovaFormula <-
+        as.formula(paste(
+          toupper(janitor::make_clean_names(j)),
+          "~",
+          responseVariable,
+          sep = ""
+        ))
+      
+      anovaFit <- aov(anovaFormula, data = datInt)
+      
+      tukeyMatrix <- as.matrix(TukeyHSD(anovaFit))
+      
+      tukeyDF <- data.frame(tukeyMatrix[[1]])
+      
+      correctionFDR <-
+        pairwise.t.test(datInt[[toupper(janitor::make_clean_names(j))]],
+                        datInt[[responseVariable]],
+                        p.adjust.method = "BH")
+      
+      correctionFdrDF <- data.frame(correctionFDR[["p.value"]])
+      
+      combinations <- rownames(tukeyMatrix[[1]])
+      
+      for (l in seq_along(combinations)) {
+        groups <- unlist(strsplit(combinations[l], "\\-"))
+        
+        datFC <- datInt[datInt[[responseVariable]] %in% groups, ]
+        
+        datFC <-
+          datFC[, c(responseVariable,
+                    toupper(janitor::make_clean_names(j)))]
+        
+        aggFormula <- as.formula(paste(".", "~", responseVariable))
+        
+        countFC <- aggregate(aggFormula, datFC, mean)
+        
+        summaryFCSaline[loop, 1] <-
+          paste(groups[1], "=", groups[2], sep = "")
+        
+        summaryFCSaline[loop, 2] <- j
+        
+        summaryFCSaline[loop, 3] <-
+          countFC[countFC[[responseVariable]] == groups[1], 2] /
+          countFC[countFC[[responseVariable]] == groups[2], 2]
+        
+        summaryFCSaline[loop, 4] <-
+          tukeyDF[rownames(tukeyDF) == combinations[l], "p.adj"]
+        
+        summaryFCSaline[loop, 5] <-
+          correctionFdrDF[rownames(correctionFdrDF) %in% groups[1],
+                          colnames(correctionFdrDF) %in% groups[2]]
+        
+        try(tTest <-
+              t.test(datInt[datInt[[responseVariable]] %in% groups, ][[toupper(janitor::make_clean_names(j))]] ~ datInt[datInt[[responseVariable]] %in% groups, ][[responseVariable]]),
+            silent = TRUE)
+        
+        summaryFCSaline[loop, 6] <- tTest$statistic
+        
+        summaryFCSaline[loop, 7] <- k
+        
+        loop <- loop + 1
+      }
+    }
+    
+  }
+  
+}
+## format colnames
+colnames(summaryFCSaline) <-
+  c("VARIABLE",
+    "METABOLITE_NAME",
+    "logFC",
+    "P_VAL",
+    "FDR",
+    "T_STAT",
+    "INTERFERENT")  
+
+summaryFCSaline$MATRIX <- "Saline"
+
+## subset results
+rowSelector <- c("saline_Test.pool=saline_Control.pool")
+subsetSummaryFCSaline <- summaryFCSaline[summaryFCSaline$VARIABLE %in% rowSelector,] %>%
+  mutate(POOL_TYPE = gsub("\\_.*", "", .$VARIABLE)) %>%
+  # filter(FDR < 0.05 & logFC < -0.5 | FDR < 0.05 & logFC > 0.5) %>%
+  select(METABOLITE_NAME, INTERFERENT, MATRIX, POOL_TYPE,logFC, FDR)
+
+
+datSaline <- datSaline %>%
+  mutate(MTX_REFERENCE = sub("_[^_]+$", "", .$MTX_REFERENCE)) %>%
+  select(MTX_REFERENCE, INTERFERENT, 
+         POOL_TYPE, SPIKING_TYPE, METABOLITE_NAME,
+         ONTOLOGY1_NAME, ONTOLOGY2_NAME, VALUE) %>%
+  group_by(MTX_REFERENCE, INTERFERENT, 
+           POOL_TYPE, SPIKING_TYPE, METABOLITE_NAME,
+           ONTOLOGY1_NAME, ONTOLOGY2_NAME) %>%
+  add_count() %>%
+  mutate(MEAN = mean(VALUE),
+         SD =sd(VALUE),
+         VARIENCE=var(VALUE), 
+         lowerCI= Rmisc::CI(VALUE)[1],
+         upperCI=Rmisc::CI(VALUE)[3]) %>%
+  ungroup() %>%
+  group_by(INTERFERENT, 
+           POOL_TYPE, SPIKING_TYPE, METABOLITE_NAME) %>%
+  mutate(bias=SimDesign::bias(MEAN, n)) %>%
+  distinct(MEAN,.keep_all=TRUE) %>%
+  mutate(posTAE=bias+2*SD,
+         negTAE=bias-2*SD,
+         Dmax=0.5*posTAE,
+         Dmin=0.5*negTAE) %>%
+  filter(SPIKING_TYPE != "Control.pool") %>%
+  select(METABOLITE_NAME, INTERFERENT, POOL_TYPE, 
+         ONTOLOGY1_NAME, ONTOLOGY2_NAME, Dmax, Dmin, lowerCI, upperCI)
+
+datMergeSaline <- full_join(datSaline, subsetSummaryFCSaline,
+                            by = c("METABOLITE_NAME", 
+                                   "INTERFERENT",
+                                   "POOL_TYPE")) %>%
+  filter(FDR < 0.05 & logFC < -2 | FDR < 0.05 & logFC > 2)  %>%
+  filter(Dmax > upperCI | Dmin < lowerCI)
+
+
+## plot data
+datPlot <- bind_rows(datMergePlasma, datMergeSaline) %>%
+  group_by(INTERFERENT, MATRIX, ONTOLOGY1_NAME) %>%
+  summarize(n=n()) %>%
+  mutate(INTERFERENT = str_wrap(INTERFERENT, width = 20)) 
+p <- datPlot %>%
+  ggplot(aes(x=INTERFERENT, y=n, fill=ONTOLOGY1_NAME)) +
+  geom_bar(position="stack", stat="identity", color="black", size=0.2) +
+  ggplot_theme +
+  xlab("") +
+  ylab("number of significant metabolites") +
+  facet_wrap( ~ MATRIX, ncol = 2) +
+  scale_fill_manual(values = brewer.pal(length(unique(datPlot$ONTOLOGY1_NAME)), "Set3")) +
+  theme(axis.text.x = element_text(angle = 90,hjust=1,vjust=0.2))
+
+print(p)
+
+## save results
+save_plot(
+  paste0("./svg/boxplot_spiking_distribution.svg"),
+  fig = p,
+  width = 15,
+  height = 12,
+  dpi = 300
+)
+
+substractedDF <- setdiff(datMergePlasma[, colnames(datMergePlasma) %in% c("METABOLITE_NAME", "INTERFERENT")],datMergeSaline[, colnames(datMergeSaline) %in% c("METABOLITE_NAME", "INTERFERENT")])
+
+uniqueMet <- datMergePlasma[datMergePlasma$METABOLITE_NAME %in% substractedDF$METABOLITE_NAME,]
+
+p <- uniqueMet %>%
+  group_by(INTERFERENT, POOL_TYPE, ONTOLOGY1_NAME) %>%
+  summarize(n=n()) %>%
+  mutate(INTERFERENT = str_wrap(INTERFERENT, width = 20)) %>%
+  ggplot(aes(x=INTERFERENT, y=n, fill=ONTOLOGY1_NAME)) +
+  geom_bar(position="stack", stat="identity", color="black", size=0.2) +
+  ggplot_theme +
+  xlab("") +
+  ylab("number of significant metabolites") +
+  facet_wrap( ~ POOL_TYPE, ncol = 2) +
+  scale_fill_manual(values = brewer.pal(length(unique(uniqueMet$ONTOLOGY1_NAME)), "Set3")) +
+  theme(axis.text.x = element_text(angle = 90,hjust=1,vjust=0.2))
+
+print(p)
+
+## save results
+save_plot(
+  paste0("./svg/boxplot_spiking_distribution_test.svg"),
+  fig = p,
+  width = 15,
+  height = 12,
+  dpi = 300
+)
+
+## metabolite signature
+sigMetabolitesNames <- metaboliteNames$METABOLITE_NAME[metaboliteNames$ID %in% gsub("^X", "", sigMetabolites)]
+
+datSigMet <- bind_rows(subsetSummaryFCPlasma, subsetSummaryFCSaline) %>%
+  group_by(INTERFERENT, POOL_TYPE) %>%
+  filter(METABOLITE_NAME %in% sigMetabolitesNames) %>%
+  select(METABOLITE_NAME, POOL_TYPE, logFC) %>%
+  mutate(METABOLITE_NAME = str_wrap(METABOLITE_NAME, width = 20),
+         logFC =log2(logFC))
+
+p <- datSigMet %>%  
+  ggplot(aes(
+    POOL_TYPE,
+    logFC,
+    group = INTERFERENT
+  )) +
+  geom_line(
+    size=1,
+    aes(group = INTERFERENT, color=INTERFERENT),
+    alpha = 0.5,
+    show.legend = FALSE
+  ) +
+  geom_point(
+    size = 3,
+    shape = 21,
+    aes(fill = INTERFERENT),
+    color = "grey45",
+    show.legend = TRUE
+  ) +
+  scale_fill_manual(values = brewer.pal(length(unique(datSigMet$INTERFERENT)), "Set1")) +
+  scale_color_manual(values = brewer.pal(length(unique(datSigMet$INTERFERENT)), "Set1")) +
+  ggplot_theme +
+  xlab("") +
+  ylab("log fold changes compared to controls") +
+  facet_wrap( ~ METABOLITE_NAME, ncol = 5) +
+  theme(axis.text.x = element_text(angle = 90,hjust=1,vjust=0.2),
+        strip.text.x = element_text(face = "bold")) +
+  ggtitle("Influence of interferent") +
+  theme(legend.position = "bottom")
+## print
+print(p)
+## save results
+save_plot(
+  paste0("./svg/interferent_distribution_signature.svg"),
+  fig = p,
+  width = 15,
+  height = 10,
+  dpi = 300
+)
+```
+
+
+## Influence of comedication: VD2
+```{r load df comed}
+dat <- read.table(paste0(here(),"/data/MTXH_08_PDCA_VD2_predictions.tsv"), 
+                  sep= "\t", 
+                  header = TRUE)
+dropvariables <- colnames(dat)[!grepl("^X|CA19_9", colnames(dat))]
+## colnames
+colnames(dat) <- toupper(colnames(dat))
+## factors
+dat$DIAGNOSIS <- factor(dat$DIAGNOSIS, levels = c("Non-pancreatic control",
+                                                  "Chronic pancreatitis",
+                                                  "Pancreatic cancer"))
+## read list of medications
+medications <- read.csv("./data/medications.csv")
+
+dat$ARZNEIMITTEL <- gsub(" ", "", dat$ARZNEIMITTEL)
+dat$ARZNEIMITTEL <- gsub("[(]", "_", dat$ARZNEIMITTEL)
+dat$ARZNEIMITTEL <- gsub("[)]", "", dat$ARZNEIMITTEL)
+
+##----------------------------------------------------------------
+##                  log transform metabolites                  --
+##----------------------------------------------------------------
+## imupte train
+logDat <- ImputeTransformScale(dat, 
+                               Impute= TRUE,
+                               Transform = TRUE,
+                               Scaling = TRUE,
+                               ScaleType = "Auto",
+                               drop.variables = dropvariables)
+colnames(logDat) <- toupper(colnames(logDat))
+
+
+## convert to h2o df
+logDat.h2o <- as.h2o(logDat)
+
+## check the performance  
+pred <- h2o.predict(mod.model, logDat.h2o)
+pred.summary <- as.data.frame(pred)
+
+## merge dataset
+dat <- cbind(dat, pred.summary)
+
+## plot
+for (i in colnames(medications)) {
+  listMed <- unlist(medications[[i]])
+  listMed <- listMed[listMed != ""]
+  dat[[toupper(i)]] <- ifelse(grepl(paste(listMed, collapse ="|"), dat$ARZNEIMITTEL), "Yes", "No")
+  ## plot
+  p <- dat %>%
+    mutate(DIAGNOSIS = str_wrap(DIAGNOSIS, width = 20)) %>%
+    ggplot(aes(
+      x=DIAGNOSIS,
+      y=PDAC
+    )) +
+    geom_boxplot(aes(fill=dat[[toupper(i)]]),
+                 alpha=0.5, 
+                 color = "black",
+                 show.legend = TRUE) +
+    geom_jitter(aes(fill=dat[[toupper(i)]]), 
+                position=position_jitterdodge(0.2),
+                color="grey45",
+                shape=21,
+                size =2, 
+                alpha = 0.3,
+                show.legend = FALSE) +
+    scale_fill_manual(values = brewer.pal(2, "Set1")[1:2]) +
+    ggplot_theme +
+    geom_hline(yintercept = cutoff) +
+    xlab("") +
+    ylab("Corrected Prediction") +
+    ylim(c(0,1)) +
+    stat_compare_means(aes(group=dat[[toupper(i)]]),
+                       label = "..p.signif..",
+                       hide.ns = TRUE) +
+    ggtitle(paste0("Influence comedications:", i)) +
+    EnvStats::stat_n_text() +
+    labs(fill=paste0(toupper(i)))
+  colname <- toupper(i)
+  
+  countN <- dat %>%
+    group_by(DIAGNOSIS,.[[toupper(i)]]) %>%
+    count(.[[toupper(i)]]) 
+  
+  banner(paste("count of", i))
+  colnames(countN)[2] <- i
+  print(countN)
+  
+  ## print
+  print(p)
+  ## save results
+  save_plot(
+    paste0("./svg/boxplot_", i,"_prediction.svg"),
+    fig = p,
+    width = 15,
+    height = 12,
+    dpi = 300
+  )
+}
+```
+
+## Influence of hemoytic, icteric and lipaemic samples (Supplementary data)
+```{r load df hemo}
+dat <- read.table(paste0(here(),"/data/MTXH_30_METAPAC_03_icteric_hemolytic_lipemic_samples_DATA.txt"), 
+                  sep= "\t", 
+                  header = TRUE)
+
+dropvariables <- colnames(dat)[!grepl("^X|CA19_9", colnames(dat))]
+## create iterations
+pred.summary <- data.frame(matrix(NA, ncol=iterations, nrow=nrow(dat)))
+
+for(i in 1:iterations){
+# uniquePatients <- data.frame(SUBJECT=unique(dat$SUBJECT_ID_INVENT))
+dat["CA19_9"] <- runif(nrow(dat), 2, 37)
+
+# dat <- merge(dat, uniquePatients, by.x="SUBJECT_ID_INVENT", by.y="SUBJECT")
+##----------------------------------------------------------------
+##                  log transform metabolites                  --
+##----------------------------------------------------------------
+## imupte train
+imputed_data <- ImputeTransformScale(dat, 
+                               Impute= TRUE,
+                               Transform = TRUE,
+                               Scaling = TRUE,
+                               ScaleType = "Auto",
+                               drop.variables = dropvariables)
+colnames(imputed_data) <- toupper(colnames(imputed_data))
+
+## convert to h2o df
+imputed_data.h2o <- as.h2o(imputed_data)
+## check the performance  
+pred <- h2o.predict(mod.model, imputed_data.h2o)
+pred.summary.itr <- as.data.frame(pred)
+pred.summary[,i] <- pred.summary.itr$PDAC
+}
+
+## summarize prediction probability
+PDAC <- apply(pred.summary, 1 , mean)
+
+##----------------------------------------------------------------
+##                         plot data                            --
+##----------------------------------------------------------------
+logDat <- dat[, colnames(dat) %in% dropvariables]
+colnames(logDat) <- toupper(colnames(logDat))
+## clean vectors 
+logDat$PRE_ANALYTICS <- as.factor(logDat$PRE_ANALYTICS)
+
+## define variables
+responseVariable <- "PRE_ANALYTICS"
+Patient_ID <- "SAMPLE_ID"
+
+## merge dataset
+plot.dat <- cbind(logDat, PDAC)
+
+## subset data 
+columnToSelect <- c(responseVariable, Patient_ID, "PDAC")
+plotHeatmap <- plot.dat[, colnames(plot.dat) %in% columnToSelect]
+
+plotHeatmap$PRE_ANALYTICS <- factor(plotHeatmap$PRE_ANALYTICS, levels = c("normal", 
+                                                                          "icteric", 
+                                                                          "hemolytic", 
+                                                                          "lipaemic"))
+
+## stat
+stat.test <- plotHeatmap %>%
+  wilcox_test(PDAC ~ PRE_ANALYTICS) %>%
+  adjust_pvalue(method="bonferroni") %>%
+  add_significance() %>%
+  filter(group1=="normal") %>%
+  mutate(y.position=1.05)
+
+## plot
+plotHeatmap <- plotHeatmap %>%
+  mutate_at(vars(matches("PRE_ANALYTICS")), as.factor)
+
+p <- ggplot(plotHeatmap, aes(
+  PRE_ANALYTICS,
+  PDAC,
+  color = PRE_ANALYTICS
+)) +
+  geom_point(
+    stat = "summary",
+    size = 3,
+    shape = 21,
+    aes(fill=PRE_ANALYTICS, group = SAMPLE_ID),
+    color = "grey45",
+    show.legend = FALSE,
+    position = pd
+  ) +
+  geom_boxplot(aes(fill=PRE_ANALYTICS), 
+               alpha=0.5, 
+               color = "black",
+               show.legend = FALSE) +
+  scale_fill_manual(values = brewer.pal(length(unique(plotHeatmap$PRE_ANALYTICS)), "Set1")) +
+  ggplot_theme +
+  xlab("") +
+  ylab("Prediction probability [class: PDAC]") +
+  stat_pvalue_manual(stat.test,
+                     label = "p.adj.signif", 
+                     x = "group2",
+                     vjust = 2,
+                     size = 4,
+                     show.legend = FALSE,
+                     hide.ns = TRUE
+  ) +
+  ggtitle("Influence of hemolytic, ecteric samples") +
+  geom_hline(yintercept = cutoff) +
+  ylim(c(0,1)) 
+## print
+print(p)
+## save
+save_plot(
+  paste0("./svg/boxplot_ecteric_prediction.svg"),
+  fig = p,
+  width = 12,
+  height = 10,
+  dpi = 300
+)
+```
+
+## Influence on Fasting status (Figure 5D)
+```{r load df fasting}
+dat <- read.table(paste0(here(),"/data/MTXH_30_METAPAC_02_Tube_type_Fasting_Pancreas_Panel_DATA.txt"), 
+                  sep= "\t", 
+                  header = TRUE)
+## subset dataset for tubes
+tubeTypes <- c("EDTA_fasted", "EDTA_P_BF", "EDTA_P_L")
+dat <- dat[dat$GROUP1 %in% tubeTypes,]
+
+dropvariables <- colnames(dat)[!grepl("^X|CA19_9", colnames(dat))]
+
+## create iterations
+pred.summary <- data.frame(matrix(NA, ncol=iterations, nrow=nrow(dat)))
+
+for(i in 1:iterations){
+uniquePatients <- data.frame(SUBJECT=unique(dat$SUBJECT_ID_INVENT))
+uniquePatients["CA19_9"] <- runif(length(uniquePatients$SUBJECT), 2, 37)
+
+dat_to_impute <- merge(dat, uniquePatients, by.x="SUBJECT_ID_INVENT", by.y="SUBJECT")
+
+##----------------------------------------------------------------
+##                  log transform metabolites                  --
+##----------------------------------------------------------------
+## imupte train
+imputed_data <- ImputeTransformScale(dat_to_impute, 
+                               Impute= TRUE,
+                               Transform = TRUE,
+                               Scaling = TRUE,
+                               ScaleType = "Auto",
+                               drop.variables = dropvariables)
+colnames(imputed_data) <- toupper(colnames(imputed_data))
+
+## convert to h2o df
+imputed_data.h2o <- as.h2o(imputed_data)
+## check the performance  
+pred <- h2o.predict(mod.model, imputed_data.h2o)
+pred.summary.itr <- as.data.frame(pred)
+pred.summary[,i] <- pred.summary.itr$PDAC
+}
+
+## summarize prediction probability
+PDAC <- apply(pred.summary, 1 , mean)
+
+##----------------------------------------------------------------
+##                         plot data                            --
+##----------------------------------------------------------------
+logDat <- dat[, colnames(dat) %in% dropvariables]
+colnames(logDat) <- toupper(colnames(logDat))
+## clean vectors 
+logDat$GROUP1  <- as.factor(logDat$GROUP1)
+
+## define variables
+responseVariable <- "GROUP1"
+Patient_ID <- "SUBJECT_ID_INVENT"
+
+## merge dataset
+plot.dat <- cbind(logDat, PDAC)
+
+## subset data 
+columnToSelect <- c(responseVariable, Patient_ID, "PDAC")
+plotHeatmap <- plot.dat[, colnames(plot.dat) %in% columnToSelect]
+
+## stat
+stat.test <- plotHeatmap %>%
+  wilcox_test(PDAC ~ GROUP1) %>%
+  adjust_pvalue(method="bonferroni") %>%
+  add_significance() %>%
+  filter(group1=="EDTA_fasted") %>%
+  mutate(y.position=1.05)
+
+## plot
+plotHeatmap <- plotHeatmap %>%
+  mutate_at(vars(matches("GROUP1")), as.factor)
+
+p <- ggplot(plotHeatmap, aes(
+  GROUP1,
+  PDAC,
+  color = GROUP1
+)) +
+  geom_line(
+    stat = "summary",
+    size = 0.5,
+    aes(group = SUBJECT_ID_INVENT),
+    alpha = 0.5,
+    color = "grey45",
+    show.legend = FALSE,
+    position = pd
+  ) +
+  geom_point(
+    stat = "summary",
+    size = 3,
+    shape = 21,
+    aes(fill=GROUP1, group = SUBJECT_ID_INVENT),
+    color = "grey45",
+    show.legend = FALSE,
+    position = pd
+  ) +
+  geom_boxplot(aes(fill=GROUP1), 
+               alpha=0.5, 
+               color = "black",
+               show.legend = FALSE) +
+  scale_fill_manual(values = brewer.pal(length(unique(plotHeatmap$GROUP1)), "Set1")) +
+  ggplot_theme +
+  xlab("") +
+  ylab("Prediction probability [class: PDAC]") +
+  stat_pvalue_manual(stat.test,
+                     label = "p.adj.signif", 
+                     x = "group2",
+                     vjust = 2,
+                     size = 4,
+                     show.legend = FALSE,
+                     hide.ns = FALSE
+  ) +
+  ggtitle("Influence of fasting status") +
+  geom_hline(yintercept = cutoff) +
+  ylim(c(0,1)) 
+## print
+print(p)
+## save
+save_plot(
+  paste0("./svg/boxplot_fasting_prediction.svg"),
+  fig = p,
+  width = 12,
+  height = 10,
+  dpi = 300
+)
+```
+
+## Influence on tube types (fig S1B)
+```{r load df tube types}
+dat <- read.table(paste0(here(),"/data/MTXH_30_METAPAC_02_Tube_type_Fasting_Pancreas_Panel_DATA.txt"), 
+                  sep= "\t", 
+                  header = TRUE)
+
+## subset dataset for tubes
+tubeTypes <- c("EDTA_fasted", "EDTA_P_BF", "EDTA_P_L")
+dat <- dat[!dat$GROUP1 %in% tubeTypes,]
+
+dropvariables <- colnames(dat)[!grepl("^X|CA19_9", colnames(dat))]
+
+## create iterations
+pred.summary <- data.frame(matrix(NA, ncol=iterations, nrow=nrow(dat)))
+
+for(i in 1:iterations){
+uniquePatients <- data.frame(SUBJECT=unique(dat$SUBJECT_ID_INVENT))
+uniquePatients["CA19_9"] <- runif(length(uniquePatients$SUBJECT), 2, 37)
+
+dat_to_impute <- merge(dat, uniquePatients, by.x="SUBJECT_ID_INVENT", by.y="SUBJECT")
+
+##----------------------------------------------------------------
+##                  log transform metabolites                  --
+##----------------------------------------------------------------
+## imupte train
+imputed_data <- ImputeTransformScale(dat_to_impute, 
+                               Impute= TRUE,
+                               Transform = TRUE,
+                               Scaling = TRUE,
+                               ScaleType = "Auto",
+                               drop.variables = dropvariables)
+colnames(imputed_data) <- toupper(colnames(imputed_data))
+
+## convert to h2o df
+imputed_data.h2o <- as.h2o(imputed_data)
+## check the performance  
+pred <- h2o.predict(mod.model, imputed_data.h2o)
+pred.summary.itr <- as.data.frame(pred)
+pred.summary[,i] <- pred.summary.itr$PDAC
+}
+
+## summarize prediction probability
+PDAC <- apply(pred.summary, 1 , mean)
+
+##----------------------------------------------------------------
+##                         plot data                            --
+##----------------------------------------------------------------
+logDat <- dat[, colnames(dat) %in% dropvariables]
+colnames(logDat) <- toupper(colnames(logDat))
+## clean vectors 
+logDat$GROUP1  <- as.factor(logDat$GROUP1)
+
+## define variables
+responseVariable <- "GROUP1"
+Patient_ID <- "SUBJECT_ID_INVENT"
+
+## merge dataset
+plot.dat <- cbind(logDat, PDAC)
+
+## subset data 
+columnToSelect <- c(responseVariable, Patient_ID, "PDAC")
+plotHeatmap <- plot.dat[, colnames(plot.dat) %in% columnToSelect]
+
+## stat
+stat.test <- plotHeatmap %>%
+  wilcox_test(PDAC ~ GROUP1) %>%
+  adjust_pvalue(method="bonferroni") %>%
+  add_significance() %>%
+  filter(group1=="BD_Vac_EDTA") %>%
+  mutate(y.position=1.05)
+
+## plot
+plotHeatmap <- plotHeatmap %>%
+  mutate_at(vars(matches("GROUP1")), as.factor)
+
+p <- ggplot(plotHeatmap, aes(
+  GROUP1,
+  PDAC,
+  color = GROUP1
+)) +
+  geom_line(
+    stat = "summary",
+    size = 0.5,
+    aes(group = SUBJECT_ID_INVENT),
+    alpha = 0.5,
+    color = "grey45",
+    show.legend = FALSE,
+    position = pd
+  ) +
+  geom_point(
+    stat = "summary",
+    size = 3,
+    shape = 21,
+    aes(fill=GROUP1, group = SUBJECT_ID_INVENT),
+    color = "grey45",
+    show.legend = FALSE,
+    position = pd
+  ) +
+  geom_boxplot(aes(fill=GROUP1), 
+               alpha=0.5, 
+               color = "black",
+               show.legend = FALSE) +
+  scale_fill_manual(values = brewer.pal(length(unique(plotHeatmap$GROUP1)), "Set1")) +
+  ggplot_theme +
+  xlab("") +
+  ylab("Prediction probability [class: PDAC]") +
+  stat_pvalue_manual(stat.test,
+                     label = "p.adj.signif", 
+                     x = "group2",
+                     vjust = 2,
+                     size = 4,
+                     show.legend = FALSE,
+                     hide.ns = TRUE
+  ) +
+  ggtitle("Influence of collection tubes") +
+  geom_hline(yintercept = cutoff) +
+  theme(axis.text.x = element_text(angle = 90,hjust=1,vjust=0.2)) +
+  ylim(c(0,1)) 
+## print
+print(p)
+## save results
+save_plot(
+  paste0("./svg/boxplot_collection_tubes_prediction.svg"),
+  fig = p,
+  width = 15,
+  height = 10,
+  dpi = 300
+)
+```
+
+## Influence on short term storage (Fig S2B-C)
+```{r load df short}
+dat <- read.table(paste0(here(),"/data/MTXH_30_METAPAC_02_short_term_storage_Pancreas_Panel_DATA.txt"), 
+                  sep= "\t", 
+                  header = TRUE)
+
+dropvariables <- colnames(dat)[!grepl("^X|CA19_9", colnames(dat))]
+
+## create iterations
+pred.summary <- data.frame(matrix(ncol=iterations, nrow=nrow(dat)))
+
+for(i in 1:iterations){
+uniquePatients <- data.frame(SUBJECT=unique(dat$SUBJECT))
+uniquePatients["CA19_9"] <- runif(length(uniquePatients$SUBJECT), 2, 37)
+
+dat_to_impute <- merge(dat, uniquePatients, by="SUBJECT")
+
+##----------------------------------------------------------------
+##                  log transform metabolites                  --
+##----------------------------------------------------------------
+## imupte train
+imputed_data <- ImputeTransformScale(dat_to_impute, 
+                               Impute= TRUE,
+                               Transform = TRUE,
+                               Scaling = TRUE,
+                               ScaleType = "Auto",
+                               drop.variables = dropvariables)
+colnames(imputed_data) <- toupper(colnames(imputed_data))
+
+
+## convert to h2o df
+imputed_data.h2o <- as.h2o(imputed_data)
+## check the performance  
+pred <- h2o.predict(mod.model, imputed_data.h2o)
+pred.summary.itr <- as.data.frame(pred)
+pred.summary[,i] <- pred.summary.itr$PDAC
+}
+
+## summarize prediction probability
+PDAC <- apply(pred.summary, 1 , mean)
+
+##----------------------------------------------------------------
+##                         plot data                            --
+##----------------------------------------------------------------
+logDat <- dat[, colnames(dat) %in% dropvariables]
+colnames(logDat) <- toupper(colnames(logDat))
+## clean data 
+logDat$TIME_SAMPLE_PROC <- ifelse(logDat$TIME_SAMPLE_PROC == "Control", 0, logDat$TIME_SAMPLE_PROC)
+
+## define variables
+responseVariable <- "TIME_SAMPLE_PROC"
+Patient_ID <- "SUBJECT"
+
+## merge dataset
+plot.dat.complete <- cbind(logDat, PDAC)
+
+
+for (plot in unique(plot.dat.complete$METAPAC_WORKPACKAGE)) {
+  
+  plot.dat <- plot.dat.complete[plot.dat.complete$METAPAC_WORKPACKAGE %in% plot, ]
+  
+  ## subset data 
+  columnToSelect <- c(responseVariable, Patient_ID, "PDAC", "CONFOUNDER")
+  plotHeatmap <- plot.dat[, colnames(plot.dat) %in% columnToSelect]
+  
+  ## clean confounder
+  plotHeatmap$CONFOUNDER <- ifelse(plotHeatmap$TIME_SAMPLE_PROC != 0, gsub("\\s+[^ ]+$", "", plotHeatmap$CONFOUNDER), plotHeatmap$CONFOUNDER)
+  
+  plotParameters <- unique(plotHeatmap$CONFOUNDER)
+  
+  ## plot 
+  for (i in plotParameters) {
+    if (grepl("Control", i)) {next}
+    if (grepl("EDTA", i)) {
+      banner(i)
+      grpl <- c(i, "EDTA Control")
+      g_subset <- plotHeatmap[plotHeatmap$CONFOUNDER %in% grpl,]
+    } else if (grepl("Heparin", i)) {
+      banner(i)
+      grpl <- c(i, "Heparin Control")
+      g_subset <- plotHeatmap[plotHeatmap$CONFOUNDER %in% grpl,]
+    } else if (grepl("Serum", i)) {
+      banner(i)
+      grpl <- c(i, "Serum Control")
+      g_subset <- plotHeatmap[plotHeatmap$CONFOUNDER %in% grpl,]
+    } 
+    ## convert to numeric
+    g_subset$TIME_SAMPLE_PROC <- as.numeric(g_subset$TIME_SAMPLE_PROC)
+    
+    ## stat 
+    stat.test <- g_subset %>%
+      wilcox_test(PDAC ~ TIME_SAMPLE_PROC) %>%
+      adjust_pvalue(method="bonferroni") %>%
+      add_significance() %>%
+      add_xy_position() %>%
+      filter(group1==0) %>%
+      mutate(y.position=1.05) 
+    ## plot
+    p <- g_subset %>%
+      ggplot(aes(
+        factor(TIME_SAMPLE_PROC),
+        PDAC
+      )) +
+      geom_line(
+    stat = "summary",
+    size = 0.5,
+    aes(group = SUBJECT),
+    alpha = 0.5,
+    color = "grey45",
+    show.legend = FALSE,
+    position = pd
+  ) +
+      geom_point(
+        stat = "summary",
+        size = 3,
+        shape = 21,
+        aes(fill= factor(TIME_SAMPLE_PROC), group=SUBJECT),
+        color = "grey45",
+        show.legend = FALSE,
+        position = pd
+      ) +
+      geom_boxplot(aes(fill= factor(TIME_SAMPLE_PROC)),
+                   alpha=0.5, 
+                   color = "black",
+                   show.legend = FALSE) +
+      scale_fill_manual(values = brewer.pal(length(unique(g_subset$TIME_SAMPLE_PROC)), "Paired")) +
+      ggplot_theme +
+      xlab("Time in hours") +
+      ylab("Prediction probability [class: PDAC]") +
+      theme(strip.text.x = element_text(face = "bold")) +
+      stat_pvalue_manual(stat.test,
+                         label = "p.adj.signif", 
+                         x = "group2",
+                         vjust = 2,
+                         size = 4,
+                         show.legend = FALSE,
+                         hide.ns = FALSE
+      ) +
+      ggtitle(paste("Influence of short term storage:", i)) +
+      geom_hline(yintercept = cutoff) +
+  ylim(c(0,1)) 
+    print(p)
+    ## save results
+    save_plot(
+      paste0(paste0("./svg/boxplot_storage_", str_replace_all(i, " ", "_"), plot, "_prediction.svg")),
+      fig = p,
+      width = 8,
+      height = 8,
+      dpi = 300
+    ) 
+  }
+}
+```
+
+## Influence on -20 deg storage (figure S2D)
+```{r load df short -20}
+dat <- read.table(paste0(here(),"/data/MTXH_30_METAPAC_01_minus_20_short_term_storage_DATA.txt"), 
+                  sep= "\t", 
+                  header = TRUE)
+
+dropvariables <- colnames(dat)[!grepl("^X|CA19_9", colnames(dat))]
+
+## create iterations
+pred.summary <- data.frame(matrix(ncol=iterations, nrow=nrow(dat)))
+
+for(i in 1:iterations){
+
+uniquePatients <- data.frame(Subject=unique(dat$Subject))
+
+uniquePatients["CA19_9"] <- runif(length(uniquePatients$Subject), 2, 37)
+
+dat_to_impute <- merge(dat, uniquePatients, by="Subject")
+
+##----------------------------------------------------------------
+##                  log transform metabolites                  --
+##----------------------------------------------------------------
+## imupte train
+imputed_data <- ImputeTransformScale(dat_to_impute, 
+                               Impute= TRUE,
+                               Transform = TRUE,
+                               Scaling = TRUE,
+                               ScaleType = "Auto",
+                               drop.variables=dropvariables)
+colnames(imputed_data) <- toupper(colnames(imputed_data))
+
+## convert to h2o df
+imputed_data.h2o <- as.h2o(imputed_data)
+## check the performance  
+pred <- h2o.predict(mod.model, imputed_data.h2o)
+pred.summary.itr <- as.data.frame(pred)
+pred.summary[,i] <- pred.summary.itr$PDAC
+}
+
+## summarize prediction probability
+PDAC <- apply(pred.summary, 1 , mean)
+
+##----------------------------------------------------------------
+##                         plot data                            --
+##----------------------------------------------------------------
+logDat <- dat[, colnames(dat) %in% dropvariables]
+colnames(logDat) <- toupper(colnames(logDat))
+## clean vectors 
+logDat$STORAGE_TIME_MINUS20 <- gsub(" weeks minus 20 degrees celcius storage", "", logDat$STORAGE_TIME_MINUS20)
+logDat$STORAGE_TIME_MINUS20 <- paste0("week_", logDat$STORAGE_TIME_MINUS20)
+logDat$STORAGE_TIME_MINUS20 <- as.factor(logDat$STORAGE_TIME_MINUS20)
+
+plot.dat <- cbind(logDat, PDAC)
+
+## define variables
+responseVariable <- "STORAGE_TIME_MINUS20"
+Patient_ID <- "SUBJECT"
+
+## subset data 
+columnToSelect <- c(responseVariable, Patient_ID, "PDAC")
+plotHeatmap <- plot.dat[, colnames(plot.dat) %in% columnToSelect]
+
+## stats
+stat.test <- plotHeatmap %>%
+  wilcox_test(PDAC ~ STORAGE_TIME_MINUS20) %>%
+  adjust_pvalue(method="bonferroni") %>%
+  add_significance() %>%
+  filter(group1=="week_0") %>%
+  mutate(y.position=1.05)
+
+pd <- position_dodge(0.4)
+
+## plot
+p <- ggplot(plotHeatmap,
+            aes(STORAGE_TIME_MINUS20,
+                PDAC,
+                color = STORAGE_TIME_MINUS20)) +
+  geom_line(
+    stat = "summary",
+    size = 0.5,
+    aes(group = SUBJECT),
+    alpha = 0.5,
+    color = "grey45",
+    show.legend = FALSE,
+    position = pd
+  ) +
+  geom_point(
+    stat = "summary",
+    size = 3,
+    shape = 21,
+    aes(fill = STORAGE_TIME_MINUS20, group = SUBJECT),
+    color = "grey45",
+    show.legend = FALSE,
+    position = pd
+  ) +
+  geom_boxplot(
+    aes(fill = STORAGE_TIME_MINUS20),
+    alpha = 0.5,
+    color = "black",
+    show.legend = FALSE
+  ) +
+  ggplot_theme +
+  xlab("") +
+  ylab("Prediction probability [class: PDAC]") +
+  stat_pvalue_manual(
+    stat.test,
+    label = "p.adj.signif",
+    x = "group2",
+    vjust = 2,
+    size = 4,
+    show.legend = FALSE,
+    hide.ns = FALSE
+  ) +
+  ggtitle("Influence of short term storage at - 20-degC") +
+  # geom_line(
+  #   stat = "summary",
+  #   size = 2,
+  #   aes(group = 1),
+  #   alpha = 1,
+  #   show.legend = FALSE,
+  #   color = "grey25"
+  # ) +
+  geom_hline(yintercept = cutoff) +
+  geom_point(
+    stat = "summary",
+    shape = 23,
+    size = 8,
+    aes(group = 1, fill = STORAGE_TIME_MINUS20),
+    alpha = 0.8,
+    show.legend = FALSE,
+    color = "grey45"
+  ) +
+  scale_fill_manual(values = brewer.pal(length(
+    unique(plotHeatmap$STORAGE_TIME_MINUS20)
+  ), "Set1"))+
+  ylim(c(0,1)) 
+## print
+print(p)
+## save results
+save_plot(
+  paste0("./svg/boxplot_storage_minus20_prediction.svg"),
+  fig = p,
+  width = 8,
+  height = 8,
+  dpi = 300
+)
+```
+
+## Influence of other cancers (supplementary data)
+```{r load df other}
+dat <- read.table(paste0(here(),"/data/MTXH_30_METAPAC_04_breast_cancer_colon_cancer_DATA.txt"), 
+                  sep= "\t", 
+                  header = TRUE)
+dropvariables <- colnames(dat)[!grepl("^X|CA19_9", colnames(dat))]
+## create iterations
+pred.summary <- data.frame(matrix(NA, ncol=iterations, nrow=nrow(dat)))
+
+for(i in 1:iterations){
+# uniquePatients <- data.frame(SUBJECT=unique(dat$SUBJECT_ID_INVENT))
+dat["CA19_9"] <- runif(nrow(dat), 2, 37)
+# dat <- merge(dat, uniquePatients, by.x="SUBJECT_ID_INVENT", by.y="SUBJECT")
+##----------------------------------------------------------------
+##                  log transform metabolites                  --
+##----------------------------------------------------------------
+## imupte train
+imputed_data <- ImputeTransformScale(dat, 
+                               Impute= TRUE,
+                               Transform = TRUE,
+                               Scaling = TRUE,
+                               ScaleType = "Auto",
+                               drop.variables = dropvariables)
+colnames(imputed_data) <- toupper(colnames(imputed_data))
+
+## convert to h2o df
+imputed_data.h2o <- as.h2o(imputed_data)
+## check the performance  
+pred <- h2o.predict(mod.model, imputed_data.h2o)
+pred.summary.itr <- as.data.frame(pred)
+pred.summary[,i] <- pred.summary.itr$PDAC
+}
+
+## summarize prediction probability
+PDAC <- apply(pred.summary, 1 , mean)
+
+##----------------------------------------------------------------
+##                         plot data                            --
+##----------------------------------------------------------------
+logDat <- dat[, colnames(dat) %in% dropvariables]
+colnames(logDat) <- toupper(colnames(logDat))
+## clean vectors 
+logDat$ORGAN <- as.factor(logDat$ORGAN)
+
+## define variables
+responseVariable <- "ORGAN"
+Patient_ID <- "SAMPLE_ID"
+
+## merge dataset
+plot.dat <- cbind(logDat, PDAC)
+
+## subset data 
+columnToSelect <- c(responseVariable, Patient_ID, "PDAC")
+plotHeatmap <- plot.dat[, colnames(plot.dat) %in% columnToSelect]
+
+## stat
+stat.test <- plotHeatmap %>%
+  wilcox_test(PDAC ~ ORGAN) %>%
+  adjust_pvalue(method="bonferroni") %>%
+  add_significance() %>%
+  mutate(y.position=1.05)
+
+## plot
+plotHeatmap <- plotHeatmap %>%
+  mutate_at(vars(matches("ORGAN")), as.factor)
+
+p <- ggplot(plotHeatmap, aes(
+  ORGAN,
+  PDAC,
+  color = ORGAN
+)) +
+  geom_point(
+    stat = "summary",
+    size = 3,
+    shape = 21,
+    aes(fill=ORGAN, group = SAMPLE_ID),
+    color = "grey45",
+    show.legend = FALSE,
+    position = pd
+  ) +
+  geom_boxplot(aes(fill=ORGAN), 
+               alpha=0.5, 
+               color = "black",
+               show.legend = FALSE) +
+  scale_fill_manual(values = brewer.pal(length(unique(plotHeatmap$ORGAN)), "Set1")) +
+  ggplot_theme +
+  xlab("") +
+  ylab("Prediction probability [class: PDAC]") +
+  stat_pvalue_manual(stat.test,
+                     label = "p.adj.signif", 
+                     x = "group2",
+                     vjust = 2,
+                     size = 4,
+                     show.legend = FALSE,
+                     hide.ns = TRUE
+  ) +
+  ggtitle("Influence on other cancer moeities") +
+  geom_hline(yintercept = cutoff) +
+  ylim(c(0,1)) 
+## print
+print(p)
+## save results
+save_plot(
+  paste0("./svg/boxplot_other_cancers_prediction.svg"),
+  fig = p,
+  width = 10,
+  height = 10,
+  dpi = 300
+) 
+```
+
+<!-- ## Influence of weight loss (supplementary data) -->
+<!-- ```{r load df weight loss} -->
+<!-- dat <- read.table(paste0(here(),"/data/MTXH_30_METAPAC_08_Weight_loss_analysis_DATA.txt"),  -->
+<!--                   sep= "\t",  -->
+<!--                   header = TRUE) -->
+
+<!-- dropvariables <- colnames(dat)[!grepl("^X|CA19_9", colnames(dat))] -->
+
+<!-- ## create iterations -->
+<!-- pred.summary <- data.frame(matrix(NA, ncol=iterations, nrow=nrow(dat))) -->
+
+<!-- for(i in 1:iterations){ -->
+<!--   dat["CA19_9"] <- runif(length(uniquePatients$SUBJECT), 2, 37) -->
+<!-- ##---------------------------------------------------------------- -->
+<!-- ##                  log transform metabolites                  -- -->
+<!-- ##---------------------------------------------------------------- -->
+<!-- ## imupte train -->
+<!-- imputed_data <- ImputeTransformScale(dat,  -->
+<!--                                Impute= TRUE, -->
+<!--                                Transform = TRUE, -->
+<!--                                Scaling = TRUE, -->
+<!--                                ScaleType = "Auto", -->
+<!--                                drop.variables = dropvariables) -->
+<!-- colnames(imputed_data) <- toupper(colnames(imputed_data)) -->
+
+<!-- ## convert to h2o df -->
+<!-- imputed_data.h2o <- as.h2o(imputed_data) -->
+<!-- ## check the performance   -->
+<!-- pred <- h2o.predict(mod.model, imputed_data.h2o) -->
+<!-- pred.summary.itr <- as.data.frame(pred) -->
+<!-- pred.summary[,i] <- pred.summary.itr$PDAC -->
+<!-- } -->
+
+<!-- ## summarize prediction probability -->
+<!-- PDAC <- apply(pred.summary, 1 , mean) -->
+
+<!-- ##---------------------------------------------------------------- -->
+<!-- ##                         plot data                            -- -->
+<!-- ##---------------------------------------------------------------- -->
+<!-- logDat <- dat[, colnames(dat) %in% dropvariables] -->
+<!-- colnames(logDat) <- toupper(colnames(logDat)) -->
+<!-- ## clean vectors  -->
+<!-- #normData$PRE_ANALYTICS <- as.factor(normData$PRE_ANALYTICS) -->
+
+<!-- responseVariable <- "WEIGHT_LOSS" -->
+<!-- time <- "TIMEPOINT" -->
+<!-- Patient_ID <- "OWNER_EXTERNAL_REFERENCE" -->
+
+<!-- logDat$TIMEPOINT <- gsub("_months", "", logDat$TIMEPOINT) -->
+
+<!-- ## merge dataset -->
+<!-- plot.dat <- cbind(logDat, PDAC) -->
+
+<!-- ## subset data  -->
+<!-- columnToSelect <- c(responseVariable, time, Patient_ID, "PDAC") -->
+<!-- plotHeatmap <- plot.dat[, colnames(plot.dat) %in% columnToSelect] -->
+
+<!-- ## stat -->
+<!-- # stat.test <- plotHeatmap %>% -->
+<!-- #   group_by(WEIGHT_LOSS) %>% -->
+<!-- #   wilcox_test(PDAC ~ TIMEPOINT) %>% -->
+<!-- #   adjust_pvalue(method="bonferroni") %>% -->
+<!-- #   add_significance() %>% -->
+<!-- #   mutate(y.position=1.05) -->
+
+<!-- ## plot -->
+<!-- plotHeatmap <- plotHeatmap %>% -->
+<!--   mutate_at(vars(matches("TIMEPOINT")), as.factor) -->
+
+<!-- plotHeatmap$WEIGHT_LOSS <- factor(plotHeatmap$WEIGHT_LOSS, levels = c("low weight loss", "moderate weight loss", "high weight loss")) -->
+
+<!-- p <-  -->
+<!--   ggplot(plotHeatmap, -->
+<!--          aes( -->
+<!--            TIMEPOINT, -->
+<!--            PDAC, -->
+<!--            color = TIMEPOINT -->
+<!--          )) + -->
+<!--   geom_line( -->
+<!--     stat = "summary", -->
+<!--     size = 0.5, -->
+<!--     aes(group = OWNER_EXTERNAL_REFERENCE), -->
+<!--     alpha = 0.5, -->
+<!--     color = "grey45", -->
+<!--     show.legend = FALSE, -->
+<!--     position = pd -->
+<!--   ) + -->
+<!--   geom_point( -->
+<!--     stat = "summary", -->
+<!--     size = 3, -->
+<!--     shape = 21, -->
+<!--     aes(fill=TIMEPOINT, group = OWNER_EXTERNAL_REFERENCE), -->
+<!--     color = "grey45", -->
+<!--     show.legend = FALSE, -->
+<!--     position = pd) + -->
+<!--   geom_boxplot(aes(fill=TIMEPOINT),  -->
+<!--                alpha=0.5,  -->
+<!--                color = "black", -->
+<!--                show.legend = FALSE) + -->
+<!--   scale_fill_manual(values = brewer.pal(length(unique(plotHeatmap$TIMEPOINT)), "Set1")) + -->
+<!--   ggplot_theme + -->
+<!--   xlab("") + -->
+<!--   ylab("Prediction probability [class: PDAC]") + -->
+<!--   facet_wrap( ~ WEIGHT_LOSS, ncol = 3) + -->
+<!--   # stat_pvalue_manual(stat.test, -->
+<!--   #                    label = "p.adj.signif",  -->
+<!--   #                    x = "group2", -->
+<!--   #                    vjust = 2, -->
+<!--   #                    size = 4, -->
+<!--   #                    show.legend = FALSE, -->
+<!--   #                    hide.ns = TRUE -->
+<!--   # ) + -->
+<!--   ggtitle("Influence on weight loss") + -->
+<!--   geom_hline(yintercept = cutoff)  -->
+<!-- ## print -->
+<!-- print(p) -->
+<!-- ## save results -->
+<!-- save_plot( -->
+<!--   paste0("./svg/boxplot_weiglt_loss_prediction.svg"), -->
+<!--   fig = p, -->
+<!--   width = 22, -->
+<!--   height = 15, -->
+<!--   dpi = 300 -->
+<!-- ) -->
+<!-- ``` -->
+
+# computing environment
+```{r}
+sessionInfo()
+```
+

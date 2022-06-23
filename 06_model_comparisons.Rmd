@@ -1,0 +1,2526 @@
+---
+title: "assay developement"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    theme: united
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: true
+subtitle: "__model comparisons__"
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics=TRUE, ind=1)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=85),tidy=TRUE, echo=TRUE, warning=FALSE, message=FALSE)
+```
+
+# load packages and datasets
+
+```{r packages}
+rm(list = ls())
+
+# load packages ---------------------------------------------------
+scriptLibraries <-  c(
+  "glmnet", 
+  "doParallel", 
+  "doMC",
+  "foreach", 
+  "ROCR",
+  "caret",
+  "broom",
+  "scales",
+  "ggplot2",
+  "sjPlot",
+  "here",
+  "h2o",
+  "openxlsx",
+  "ggalluvial"
+)
+##---------------------------------------------------------------
+##                      load functions                         --
+##---------------------------------------------------------------
+source("~/r_functions/basicFunctions.R")
+source("~/r_functions/ImputeTransformScale.R")
+source("~/r_functions/cutOff.R")
+source("~/r_functions/runH2Omodels.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+# ggplot theme --------------------------------------------------
+ggplot_theme <- theme_bw() +
+  theme(
+    axis.line = element_line(size = 0.75),
+    axis.text = element_text(
+      size = 11,
+      face = "bold",
+      colour = "black"
+    ),
+    axis.title = element_text(size = 12, face = "bold")
+  )
+
+```
+
+## initiate h2o
+
+```{r h2o}
+##----------------------------------------------------------------
+##             detect the number of cores available             --
+##----------------------------------------------------------------
+myCores = parallel::detectCores(all.tests = TRUE) - 1
+
+if (myCores > 20) {
+  myCores = 20
+} else
+  myCores = myCores
+
+
+memFreeG = 50
+# Sys.setenv(JAVA_HOME = "/dss/dsshome1/lxc00/ru64waf2/bin/jdk-13.0.2")
+##----------------------------------------------------------------
+##                         initiate h2o                         --
+##----------------------------------------------------------------
+h2o.init(
+  nthreads = myCores,
+  min_mem_size = paste(memFreeG, "g", sep = ""),
+  max_mem_size = paste(memFreeG, "g", sep = "")
+)
+h2o.no_progress()
+h2o.removeAll()
+```
+
+# keys
+
+```{r keys}
+##---------------------------------------------------------------
+##                         define keys                         --
+##---------------------------------------------------------------
+time <- 12*60*60
+prevalence = 1.95/100
+```
+
+# load data
+
+```{r load}
+##---------------------------------------------------------------
+## load data --
+##---------------------------------------------------------------
+train <- readRDS("./ml_dataset/ImputedTrain.rds")
+testComplete <- readRDS("./ml_dataset/ImputedTest.rds")
+test <- testComplete[!testComplete$Diagnosis %in% "Non-pancreatic control", ]
+validationComplete <- readRDS("./ml_dataset/ImputedValidation.rds")
+validation <- validationComplete[!validationComplete$Diagnosis %in% "Non-pancreatic control",
+]
+# load metabolite names ---------------------------------------------------
+metaboliteNames <- read.csv("./masterTable/masterTableMetaboliteNames.csv", stringsAsFactors = FALSE)
+```
+
+## define response and features
+
+```{r response}
+##----------------------------------------------------------------
+## define response variable --
+##----------------------------------------------------------------
+response <- "Disease_status"
+train[[response]] <- as.factor(train[[response]])
+test[[response]] <- as.factor(test[[response]])
+validation[[response]] <- as.factor(validation[[response]])
+##----------------------------------------------------------------
+## merge features --
+##----------------------------------------------------------------
+columnToselect <- c("^X", response, "CA19_9")
+features <- setdiff(colnames(train)[grepl(paste(columnToselect, collapse = "|"), colnames(train))],
+                    response)
+```
+
+## h2o model comparisons
+
+```{r}
+base.model <- h2o.loadModel(paste0(here(),"/h2o_results/base/GLM_1_AutoML_20211203_140000"))
+itr.model <- h2o.loadModel(paste0(here(),"/h2o_results/iteration/GLM_1_AutoML_20211203_140046"))
+mod.model <- h2o.loadModel(paste0(here(),"/h2o_results/feature_reduction/GLM_1_AutoML_20211203_140114"))
+
+##----------------------------------------------------------------
+## convert h2o df --
+##----------------------------------------------------------------
+train <- as.h2o(train)
+test <- as.h2o(test)
+validation <- as.h2o(validation)
+
+selected.model <- mod.model
+
+p <- plotVarImp(selected.model)
+
+## print
+print(p)
+save_plot(
+  "./svg/h2o_varImp_selectedModel.svg",
+  fig = p,
+  width = 15,
+  height = 9,
+  dpi = 300
+)
+```
+
+## performance
+
+### test performance
+```{r}
+banner("test performance")
+perf.test <- h2o.performance(selected.model, test)
+perf.test
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(perf.test, "f1")
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(perf.test, cutoff.selected.model))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred 
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2], 
+    cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+## confusion matrix
+cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+cm
+plotCM(cm)
+```
+
+### validation performance
+```{r}
+banner("validation performance")
+perf.validation <- h2o.performance(selected.model, validation)
+perf.validation
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(perf.validation, cutoff.selected.model))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2], 
+    cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+## confusion matrix
+cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+cm
+plotCM(cm)
+```
+
+## auc curves
+```{r}
+p <- list(h2o.performance(base.model, newdata = validation), h2o.performance(itr.model,
+    newdata = validation), h2o.performance(selected.model, newdata = validation)) %>%
+    map(function(x) x %>%
+        .@metrics %>%
+        .$thresholds_and_metric_scores %>%
+        .[c("tpr", "fpr")] %>%
+        add_row(tpr = 0, fpr = 0, .before = T) %>%
+        add_row(tpr = 0, fpr = 0, .before = F)) %>%
+    map2(c("Base model", "Iterated model", "Selected model"), function(x, y) x %>%
+        add_column(model = y)) %>%
+    reduce(rbind) %>%
+    # plot fpr and tpr, map model to color as grouping
+ggplot(aes(fpr, tpr, col = model)) + geom_line(size = 1.5) + geom_segment(aes(x = 0, y = 0,
+    xend = 1, yend = 1), linetype = 2, col = "#80796BFF") + xlab("False Positive Rate") +
+    ylab("True Positive Rate") + ggtitle("Comparision of ROC curves of different learners: validation") +
+    theme_bw() + scale_color_manual(values = brewer.pal(3, "Set1")) + theme(axis.line = element_line(size = 0.75),
+    axis.text = element_text(size = 11, face = "bold", colour = "black"), axis.title = element_text(size = 12,
+        face = "bold"), legend.title = element_text(size = 12, face = "bold", colour = "black"),
+    legend.text = element_text(size = 11, face = "bold", colour = "black")) + theme(legend.position = c(0.75,
+    0.25))
+
+print(p)
+
+save_plot("./svg/ROC_validation.svg", fig = p, width = 8, height = 8, dpi = 300)
+```
+
+### check prevalence vs performance
+```{r}
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(mod.model, test), "f1")
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(h2o.performance(mod.model, validation), cutoff.selected.model))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+    cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+
+## confusion matrix
+cm.df <- c()
+for (i in seq(from=0.1, to=60.0, by=0.05)){
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = i/100)
+  cm.results <- as.data.frame(t(cm$byClass))
+  cm.df <- bind_rows(cm.df, cm.results)
+}
+
+## plot influence of prevalance
+cm.df <- gather(cm.df, key = "variable", value = "value", -Prevalence) 
+
+p <- ggplot(cm.df, aes(x = Prevalence*100,
+                y = value, 
+                group = variable,
+                color = variable)) +
+  geom_line(size = 2) +
+  ggplot_theme +
+  xlab("prevalance in %") 
+  
+print(p)
+```
+
+### compare roc
+```{r}
+pred.base <- h2o.predict(base.model, validation)
+pred.summary.base <- as.data.frame(pred.base)
+pred.summary.base[["response"]] <- as.data.frame(validation[[response]])
+
+pred.mod <- h2o.predict(mod.model, validation)
+pred.summary.mod <- as.data.frame(pred.mod)
+pred.summary.mod[["response"]] <- as.data.frame(validation[[response]])
+
+library(pROC)
+
+roc.base <- roc(response = pred.summary.base$response$Disease_status, 
+                predictor = pred.summary.base$PDAC)
+
+roc.mod <- roc(response = pred.summary.mod$response$Disease_status, 
+               predictor = pred.summary.mod$PDAC)
+
+roc.test(roc.base, roc.mod,
+         method = "bootstrap", 
+         boot.n = 1000, 
+         progress = "none", 
+         paired = F)
+```
+
+## h2o model statistics
+### base model
+#### test
+```{r}
+testHighCA <- test[!test$lowCA %in% "low",]
+testHighCA_clinical <- test[test$lowCA_clinical %in% "low",]
+testResect <- test[!test$resectable %in% "no",]
+
+h2o.auc(h2o.performance(base.model, test))
+
+banner("base model AUC: test")
+cv.results <- data.frame()
+
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(base.model, newdata=test), "f1")
+
+banner("cutoff max F1")
+cutoff.selected.model
+
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(test)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- test[-Indexes, ]
+  perf.cv <- h2o.performance(base.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+cv.results.summary
+
+banner("base model AUC: test: resectable patients only")
+
+testResect <- test[!test$resectable %in% "no",]
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(base.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(testResect)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- testResect[-Indexes, ]
+  perf.cv <- h2o.performance(base.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+
+banner("base model AUC: validation: detectable CA19.9 only")
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(base.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(testHighCA)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- testHighCA[-Indexes, ]
+  perf.cv <- h2o.performance(base.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+
+banner("base model AUC: test: CA19.9 < 37")
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(base.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(testHighCA_clinical)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- testHighCA_clinical[-Indexes, ]
+  perf.cv <- h2o.performance(base.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+```
+
+#### validation
+```{r}
+validationHighCA <- validation[!validation$lowCA %in% "low",]
+validationHighCA_clinical <- validation[validation$lowCA_clinical %in% "low",]
+validationResect <- validation[!validation$resectable %in% "no",]
+
+h2o.auc(h2o.performance(base.model, validation))
+
+banner("base model AUC: validation")
+cv.results <- data.frame()
+
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(base.model, newdata=test), "f1")
+
+banner("cutoff max F1")
+cutoff.selected.model
+
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(validation)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- validation[-Indexes, ]
+  perf.cv <- h2o.performance(base.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+cv.results.summary
+
+banner("base model AUC: validation: resectable patients only")
+
+validationResect <- validation[!validation$resectable %in% "no",]
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(base.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(validationResect)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- validationResect[-Indexes, ]
+  perf.cv <- h2o.performance(base.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+
+banner("base model AUC: validation: detectable CA19.9 only")
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(base.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(validationHighCA)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- validationHighCA[-Indexes, ]
+  perf.cv <- h2o.performance(base.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+
+banner("base model AUC: test: CA19.9 < 37")
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(base.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(validationHighCA_clinical)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- validationHighCA_clinical[-Indexes, ]
+  perf.cv <- h2o.performance(base.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+```
+
+### iterative model
+#### test
+```{r}
+testHighCA <- test[!test$lowCA %in% "low",]
+testResect <- test[!test$resectable %in% "no",]
+
+h2o.auc(h2o.performance(itr.model, test))
+
+banner("iterative model AUC: test")
+cv.results <- data.frame()
+
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(itr.model, newdata=test), "f1")
+
+banner("cutoff max F1")
+cutoff.selected.model
+
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(test)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- test[-Indexes, ]
+  perf.cv <- h2o.performance(itr.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+cv.results.summary
+
+banner("iterative model AUC: test: resectable patients only")
+
+testResect <- test[!test$resectable %in% "no",]
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(itr.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(testResect)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- testResect[-Indexes, ]
+  perf.cv <- h2o.performance(itr.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+
+banner("iterative model AUC: validation: detectable CA19.9 only")
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(itr.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(testHighCA)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- testHighCA[-Indexes, ]
+  perf.cv <- h2o.performance(itr.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+
+banner("iterative model AUC: validation: CA19.9 > 37 only")
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(itr.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(testHighCA_clinical)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- testHighCA_clinical[-Indexes, ]
+  perf.cv <- h2o.performance(itr.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+```
+
+#### validation
+```{r}
+validationHighCA <- validation[!validation$lowCA %in% "low",]
+validationHighCA_clinical <- validation[validation$lowCA_clinical %in% "low",]
+validationResect <- validation[!validation$resectable %in% "no",]
+
+h2o.auc(h2o.performance(itr.model, validation))
+
+banner("iterative model AUC: validation")
+cv.results <- data.frame()
+
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(itr.model, newdata=test), "f1")
+
+banner("cutoff max F1")
+cutoff.selected.model
+
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(validation)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- validation[-Indexes, ]
+  perf.cv <- h2o.performance(itr.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+cv.results.summary
+
+banner("itr model AUC: validation: resectable patients only")
+
+validationResect <- validation[!validation$resectable %in% "no",]
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(itr.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(validationResect)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- validationResect[-Indexes, ]
+  perf.cv <- h2o.performance(itr.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+
+banner("itr model AUC: validation: detectable CA19.9 only")
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(itr.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(validationHighCA)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- validationHighCA[-Indexes, ]
+  perf.cv <- h2o.performance(itr.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+
+banner("itr model AUC: validation: CA19.9 < 37 only")
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(itr.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(validationHighCA_clinical)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- validationHighCA_clinical[-Indexes, ]
+  perf.cv <- h2o.performance(itr.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+```
+
+### selected model
+#### test
+```{r}
+testHighCA <- test[!test$lowCA %in% "low",]
+testResect <- test[!test$resectable %in% "no",]
+
+h2o.auc(h2o.performance(mod.model, test))
+
+banner("iterative model AUC: test")
+cv.results <- data.frame()
+
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(mod.model, newdata=test), "f1")
+
+banner("cutoff max F1")
+cutoff.selected.model
+
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(test)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- test[-Indexes, ]
+  perf.cv <- h2o.performance(mod.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+cv.results.summary
+
+banner("iterative model AUC: test: resectable patients only")
+
+testResect <- test[!test$resectable %in% "no",]
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(mod.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(testResect)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- testResect[-Indexes, ]
+  perf.cv <- h2o.performance(mod.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+
+banner("iterative model AUC: validation: detectable CA19.9 only")
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(mod.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(testHighCA)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- testHighCA[-Indexes, ]
+  perf.cv <- h2o.performance(mod.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+
+banner("iterative model AUC: validation: CA19.9 < 37 only")
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(mod.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(testHighCA_clinical)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- testHighCA_clinical[-Indexes, ]
+  perf.cv <- h2o.performance(mod.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+```
+
+#### validation
+```{r}
+validationHighCA <- validation[!validation$lowCA %in% "low",]
+validationHighCA_clinical <- validation[validation$lowCA_clinical %in% "low",]
+validationResect <- validation[!validation$resectable %in% "no",]
+
+h2o.auc(h2o.performance(mod.model, validation))
+
+banner("mod model AUC: validation")
+cv.results <- data.frame()
+
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(mod.model, newdata=test), "f1")
+
+banner("cutoff max F1")
+cutoff.selected.model
+
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(validation)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- validation[-Indexes, ]
+  perf.cv <- h2o.performance(mod.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+cv.results.summary
+
+banner("mod model AUC: validation: resectable patients only")
+
+validationResect <- validation[!validation$resectable %in% "no",]
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(mod.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(validationResect)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- validationResect[-Indexes, ]
+  perf.cv <- h2o.performance(mod.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+
+banner("mod model AUC: validation: detectable CA19.9 only")
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(mod.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(validationHighCA)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- validationHighCA[-Indexes, ]
+  perf.cv <- h2o.performance(mod.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+
+banner("mod model AUC: validation: CA19.9 < 37 only")
+
+cv.results <- data.frame()
+## cutoff of selected model
+cutoff.selected.model <- h2o.find_threshold_by_max_metric(h2o.performance(mod.model, newdata=test), "f1")
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(validationHighCA_clinical)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- validationHighCA_clinical[-Indexes, ]
+  perf.cv <- h2o.performance(mod.model, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff.selected.model))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                              min = min(value), 
+                              n  = n(),
+                              se = sd / sqrt(n),
+                              lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                              upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+cv.results.summary
+```
+
+## load updated glmnet model
+```{r}
+load("./glmnet_models/mfit.RData")
+
+banner("validation set")
+## load validation dataset
+ImputedValidationNew <- readRDS("./ml_dataset/ImputedValidation.rds")
+ImputedValidationNew <- ImputedValidationNew[!ImputedValidationNew$Diagnosis %in% "Non-pancreatic control", ]
+
+# define response variable -----------------------------------------------
+response <- "Disease_status"
+
+# define features --------------------------------------------------------
+features <- setdiff(colnames(train)[grepl("^X|Disease_status|CA19_9", colnames(train))],
+                    response)
+
+## validation dataset
+validationXnew <- as.matrix(ImputedValidationNew[, colnames(ImputedValidationNew) %in% features])
+validationYnew <- as.matrix(ImputedValidationNew[, colnames(ImputedValidationNew) %in% response])
+
+## validation prediction
+ImputedValidationNew$prediction = predict(mfit, newx = validationXnew, s =  mfit$lambda,
+                                          type = "response")
+
+### reported cutoff
+cutoff <- 0.572
+
+ImputedValidationNew$predictionClass <- ifelse(ImputedValidationNew$prediction < cutoff,
+                                               "CP", "PDAC")
+
+
+roc.glmnet_new <- roc(response = ImputedValidationNew$Disease_status, 
+                      predictor = ImputedValidationNew$prediction)
+```
+
+## old Gut 2018 model (9 metabolites)
+
+```{r}
+metabolites <- c("X38100079",
+                 "X1100339990057",
+                 "X68100055",
+                 "X38102397",
+                 "X379990019",
+                 "X38100466",
+                 "X38100002",
+                 "X68100027",
+                 "X1100339990045")
+
+##---------------------------------------------------------------
+##                    load metabolite names                    --
+##---------------------------------------------------------------
+metaboliteNames <- 
+  read.csv("./masterTable/masterTableMetaboliteNames.csv",
+           stringsAsFactors = FALSE)
+##----------------------------------------------------------------
+##                     load metabolite data                     --
+##----------------------------------------------------------------
+origData <-
+  read.xlsx(
+    "./data/metapac_VD2/ID_VD1_VD2_PLASMA_SERUM_MxP_Metabolomics_Data_2019-08-14_MetaboliteData_MTXH.xlsx",
+    1
+  )
+##----------------------------------------------------------------
+##                      load clinical data                      --
+##----------------------------------------------------------------
+clinData1 <-
+  read.xlsx("./data/metapac_VD2/Clinical_data_ID_VD1_VD2_Status_20170427.xlsx", 
+  )
+
+clinData2 <-
+  read.xlsx("./data/metapac_VD2/Clinical_data_ID_VD1_VD2_Status_20170427.xlsx", 
+            2)
+##---------------------------------------------------------------
+##                     merge clinical data                     --
+##---------------------------------------------------------------
+clinData <-
+  merge(clinData1,
+        clinData2,
+        all = TRUE,
+        by = "OWNER_ID",
+        sort = FALSE)
+##----------------------------------------------------------------
+##                      merge all datasets                      --
+##----------------------------------------------------------------
+expData <-
+  merge(origData,
+        clinData,
+        all = FALSE,
+        by = "ALIQUOT_ID",
+        sort = FALSE)
+##---------------------------------------------------------------
+##                  assign disease categories                  --
+##---------------------------------------------------------------
+expData$Disease_short <-
+  ifelse(
+    expData$DIAGNOSE == "Blutspender",
+    "Control",
+    ifelse(
+      expData$DIAGNOSE == "Control",
+      "Non_pancreatic_control",
+      ifelse(
+        expData$DIAGNOSE == "Leberzirrhose",
+        "Non_pancreatic_control",
+        ifelse(
+          expData$DIAGNOSE == "Non-pancreatic control",
+          "Non_pancreatic_control",
+          ifelse(
+            expData$DIAGNOSE == "Pankreatitis",
+            "CP",
+            ifelse(expData$DIAGNOSE == "CP", "CP", "PDAC")
+          )
+        )
+      )
+    )
+  )
+##---------------------------------------------------------------
+##                    clear corrupt columns                    --
+##---------------------------------------------------------------
+colnames(expData) <- gsub(".x", "", colnames(expData))
+colnames(expData) <- gsub(".y", "", colnames(expData))
+##---------------------------------------------------------------
+##                  delete duplicated columns                  --
+##---------------------------------------------------------------
+expData <- expData[, !duplicated(colnames(expData))]
+##---------------------------------------------------------------
+##                        clear names                          --
+##---------------------------------------------------------------
+expData <- expData %>%
+  janitor::clean_names(case = "none")
+
+## subset data for plasma measurements
+expData <- expData[expData$MATRIX %in% "Human Plasma",]
+
+## subset for metabolites
+columnToRetain <- c("EXTERNAL_REFERENCE", 
+                    "PROJECT_PHASE",
+                    "CA_19_9", 
+                    "Disease_short",
+                    metabolites)
+
+expData.scrimmed <- expData[, colnames(expData) %in% columnToRetain]
+## imputations
+ImputedData <- ImputeTransformScale(expData.scrimmed, 
+                                    Impute= TRUE,
+                                    Transform = TRUE,
+                                    Scaling = TRUE,
+                                    ScaleType = "Auto",
+                                    drop.variables = c("EXTERNAL_REFERENCE", 
+                    "PROJECT_PHASE",
+                    "Disease_short"))
+## subset for CP and PDAC
+ImputedData <- ImputedData[!ImputedData$Disease_short %in% "Non_pancreatic_control",]
+
+## subset for cohorts
+ImputedDataTrain <- ImputedData[ImputedData$PROJECT_PHASE %in% "ID",]
+ImputedDataTest <- ImputedData[ImputedData$PROJECT_PHASE %in% "VD1",]
+ImputedDataValidation <- ImputedData[ImputedData$PROJECT_PHASE %in% "VD2",]
+```
+
+### elastic net
+
+#### data preparation
+
+```{r net data}
+features <- colnames(ImputedData)[grepl("^X|CA_19_9", colnames(ImputedData))]
+response <- "Disease_short"
+## train dataset
+trainX<- as.matrix(ImputedDataTrain[,colnames(ImputedDataTrain) %in% features])
+trainY <- as.matrix(ImputedDataTrain[,colnames(ImputedDataTrain) %in% response])
+
+## test dataset
+testX<- as.matrix(ImputedDataTest[,colnames(ImputedDataTest) %in% features])
+testY <- as.matrix(ImputedDataTest[,colnames(ImputedDataTest) %in% response])
+
+## validation dataset
+validationX <- as.matrix(ImputedDataValidation[,colnames(ImputedDataValidation) %in% features])
+validationY <- as.matrix(ImputedDataValidation[,colnames(ImputedDataValidation) %in% response])
+```
+
+#### grid search
+
+```{r grid}
+if (file.exists("./glmnet_models/mfitOld.RData")==FALSE) {
+  set.seed(123456)
+  ## Elastic net with 0 < alpha < 1
+  a <- seq(0.1, 0.9, 0.01)
+  
+  numberOfCores <- parallel::detectCores(all.tests = TRUE) - 1
+  
+  ## search grid
+  if(Sys.info()["sysname"]=="Windows"){
+    cl<-makeCluster(numberOfCores)
+    registerDoParallel(cl)
+  }else{
+    registerDoMC(numberOfCores)
+  }
+  
+  search <- foreach(i = a, .combine = rbind) %dopar% {
+    cv <- cv.glmnet(x = trainX,
+                    y = trainY,
+                    family = "binomial",
+                    nfold = 10,
+                    type.measure = "deviance",
+                    parallel = TRUE,
+                    standardize=FALSE,
+                    alpha = i)
+    data.frame(cvm = cv$cvm[cv$lambda == cv$lambda.1se],
+               lambda.1se = cv$lambda.1se,
+               alpha = i)
+  }
+  ## best tuning parameters
+  cvIndex <- search[search$cvm == min(search$cvm), ]
+  cvIndex
+  
+  ## final model
+  mfitOld <-glmnet(trainX,
+                   trainY,
+                   family = "binomial",
+                   nfold = 10,
+                   type.measure = "deviance",
+                   parallel = TRUE,
+                   standardize=TRUE,
+                   alpha = 0.5,
+                   lambda =  cvIndex$lambda.1se,
+                   keep = TRUE)
+  # Save model
+  save(mfitOld, file="./glmnet_models/mfitOld.RData")
+} else
+ load("./glmnet_models/mfitOld.RData")
+
+## coefficients
+coef <- mfitOld$beta
+coefDF <- as.data.frame(as.matrix(coef))
+
+# metabolite ID to metabolite names 
+rownames(coefDF) <- gsub("^X", "", rownames(coefDF))
+matchColumnNames <-
+  match(rownames(coefDF), metaboliteNames$ID, nomatch = 0)
+rownames(coefDF)[rownames(coefDF) %in% metaboliteNames$ID] <-
+  metaboliteNames$METABOLITE_NAME[matchColumnNames]
+colnames(coefDF) <- "coefficient"
+coefDF$varImp <- ifelse(coefDF$coefficient %in% 0, "*", "")
+
+## coef print
+tab_df(coefDF, show.rownames = TRUE, digits = 3)
+```
+
+#### model prediction
+
+```{r pred}
+## train prediction
+ImputedDataTrain$prediction = predict(mfitOld, 
+                                      newx = trainX, 
+                                      s = mfitOld$lambda,
+                                      type="response")
+
+## test prediction
+ImputedDataTest$prediction = predict(mfitOld, 
+                                     newx = testX, 
+                                     s = mfitOld$lambda,
+                                     type="response")
+
+## validation prediction
+ImputedDataValidation$prediction = predict(mfitOld, 
+                                           newx = validationX, 
+                                           s = mfitOld$lambda,
+                                           type="response")
+```
+
+#### cutoff
+
+```{r cutoff}
+reported.cutoff <- 0.384
+```
+
+#### cutoff based on roc
+
+```{r roc cutoff}
+cm_info <- ConfusionMatrixInfo( data = ImputedDataTest, 
+                                predict = "prediction", 
+                                actual = response, 
+                                cutoff = reported.cutoff,
+                                PositiveGroup = "PDAC",
+                                NegativeGroup = "CP")
+p <- cm_info$plot
+## print
+print(p)
+## save results
+save_plot(
+  paste0("./svg/glmnet_cutoff_old.svg"),
+  fig = p,
+  width = 15,
+  height = 9,
+  dpi = 300
+)
+```
+
+#### calculate confusionMatrix
+
+```{r cm}
+ImputedDataTrain$predictionClass <- ifelse(ImputedDataTrain$prediction < reported.cutoff,
+                                           "CP", "PDAC")
+
+ImputedDataTest$predictionClass <- ifelse(ImputedDataTest$prediction < reported.cutoff,
+                                          "CP", "PDAC")
+
+ImputedDataValidation$predictionClass <- ifelse(ImputedDataValidation$prediction < reported.cutoff,
+                                                "CP", "PDAC")
+
+banner("train")
+confusionMatrix(as.factor(ImputedDataTrain$Disease_short),
+                as.factor(ImputedDataTrain$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+banner("test")
+confusionMatrix(as.factor(ImputedDataTest$Disease_short),
+                as.factor(ImputedDataTest$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+banner("validation")
+confusionMatrix(as.factor(ImputedDataValidation$Disease_short),
+                as.factor(ImputedDataValidation$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+```
+
+
+#### auc
+
+```{r auc}
+perf.glmnet <- function(truth, pred, predClass, boot.n = 1000, prevalence) {
+  reps <- boot.n
+  predClass <- as.factor(predClass)
+  boot.pred <- matrix(0, nrow = length(truth), ncol = reps)
+  boot.predClass <- matrix(0, nrow = length(truth), ncol = reps)
+  boot.truth <- matrix(0, nrow = length(truth), ncol = reps)
+  for (rep in 1:reps) {
+    bootstrap_indices <- sample(1:length(truth), length(truth), replace = TRUE)
+    boot.pred[, rep] <- pred[bootstrap_indices]
+    boot.predClass[, rep] <- predClass[bootstrap_indices]
+    boot.truth[, rep] <- truth[bootstrap_indices]
+  }
+  
+  pred.obj <- prediction(boot.pred, boot.truth)
+  acc <- performance(pred.obj, measure = "acc")
+  
+  cmResults <- data.frame()
+  
+  for (i in 1:ncol(boot.truth)) {
+    cm <- confusionMatrix(as.factor(boot.truth[,i]), 
+                          as.factor(boot.predClass[,i]), 
+                          prevalence = prevalence)
+    
+    cmResults[i, "accuracy"] = cm$overall['Accuracy']
+    cmResults[i, "specificity"] = cm$byClass["Specificity"]
+    cmResults[i,"sensitivity"] = cm$byClass["Sensitivity"]
+    cmResults[i, "ppv"] = cm$byClass["Pos Pred Value"]
+    cmResults[i, "npv"] = cm$byClass["Neg Pred Value"]
+    
+  }
+  
+  perf <- list(pred = pred, 
+               truth = truth, 
+               roc = performance(pred.obj, measure = "tpr",x.measure = "fpr"), 
+               auc = performance(pred.obj, measure = "auc"), 
+               acc = performance(pred.obj,
+                                 measure = "acc"),
+               cmResults = cmResults
+               )
+  invisible(perf)
+  
+}
+banner("model performance train")
+perfTrain <- perf.glmnet(pred = ImputedDataTrain$prediction, 
+                         truth =as.factor(ImputedDataTrain$Disease_short),
+                         predClass = ImputedDataTrain$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC")
+Rmisc::CI(as.numeric(perfTrain$auc@y.values), ci=.95)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTrain$auc@y.values), ci=.95)
+sapply(perfTrain$cmResults, Rmisc::CI)
+
+banner("model performance test")
+perfTest <- perf.glmnet(pred = ImputedDataTest$prediction, 
+                         truth =as.factor(ImputedDataTest$Disease_short),
+                         predClass = ImputedDataTest$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC")
+Rmisc::CI(as.numeric(perfTest$auc@y.values), ci=.95)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfTest$auc@y.values), ci=.95)
+sapply(perfTest$cmResults, Rmisc::CI)
+
+banner("model performance validation")
+perfValidation <- perf.glmnet(pred = ImputedDataValidation$prediction, 
+                         truth =as.factor(ImputedDataValidation$Disease_short),
+                         predClass = ImputedDataValidation$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC")
+Rmisc::CI(as.numeric(perfValidation$auc@y.values), ci=.95)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfValidation$auc@y.values), ci=.95)
+sapply(perfValidation$cmResults, Rmisc::CI)
+```
+
+#### plot roc
+
+```{r roc}
+plotROC <- function(model.list,model.names) {
+  df <- data.frame()
+  auc <- list()
+  for (l in 1:length(model.list)) {
+    perf.roc <- model.list[[l]]$roc
+    perf.avg <- perf.roc
+    alpha.values.list <- unlist(perf.avg@alpha.values)
+    alpha.values.list[mapply(is.infinite, alpha.values.list)] <- 0
+    
+    alpha.values <- rev(seq(min(alpha.values.list),
+                            max(alpha.values.list),
+                            length=max(sapply(perf.avg@alpha.values, length))))
+    for (i in 1:length(perf.avg@y.values)) {
+      perf.avg@x.values[[i]] <-
+        stats::approxfun(perf.avg@alpha.values[[i]],perf.avg@x.values[[i]],
+                         rule=2, ties=mean)(alpha.values)
+      perf.avg@y.values[[i]] <-
+        stats::approxfun(perf.avg@alpha.values[[i]], perf.avg@y.values[[i]],
+                         rule=2, ties=mean)(alpha.values)
+    }
+    
+    x <- c(rowMeans(data.frame(perf.avg@x.values)),0)
+    y <- c(rowMeans(data.frame(perf.avg@y.values)),0)
+    
+    df_unique <- data.frame(fpr=x,
+                            tpr=y,
+                            model=model.names[l])
+    colnames(df_unique) <- c("fpr", "tpr", "model")
+    
+    df <- rbind(df, df_unique)
+    
+    ## auc
+    auc[[model.names[l]]] <- Rmisc::CI(as.numeric(model.list[[l]]$auc@y.values), ci=.95)
+  }
+  
+  col <- RColorBrewer::brewer.pal(length(unique(df$model)), "Set1")
+  plot <- ggplot(df,
+                 aes(x=fpr,
+                     y=tpr,
+                     color=model)) +
+    geom_line(size=2) +
+    theme_bw() +
+    theme(
+      axis.line = element_line(size = 0.75),
+      axis.text = element_text(
+        size = 11,
+        face = "bold",
+        colour = "black"
+      ),
+      axis.title = element_text(size = 12, face = "bold")
+    ) +
+    scale_color_manual(values = col) +
+    theme(legend.position = c(0.8, 0.1),
+          legend.background = element_blank(),
+          legend.text = element_text(size= 12, face="bold"),
+          legend.title = element_blank()) +
+    labs(x="False Positive Rate",
+         y="True Positive Rate")
+}
+
+##----------------------------------------------------------------
+##                        train set (ID)                        --
+##----------------------------------------------------------------
+model.names <- c("Biomarker signature")
+model.list <- list(perfTrain)
+p <- plotROC(model.list, model.names) + ggtitle("train set")
+## print
+print(p)
+##----------------------------------------------------------------
+##                        test set (VD1)                        --
+##----------------------------------------------------------------
+model.names <- c("Biomarker signature")
+model.list <- list(perfTest)
+p <- plotROC(model.list, model.names) + ggtitle("test set")
+## print
+print(p)
+
+##----------------------------------------------------------------
+##                   validation set (VD2)                       --
+##----------------------------------------------------------------
+model.names <- c("Biomarker signature")
+model.list <- list(perfValidation)
+p <- plotROC(model.list, model.names) + ggtitle("validation set")
+## print
+print(p)
+```
+
+## Calculate performace of all 3 models
+
+### plot auc
+
+```{r}
+banner("h2o model")
+auc.mod.model <- h2o.performance(mod.model, validation) 
+
+auc.mod.model <-  auc.mod.model@metrics$thresholds_and_metric_scores
+
+auc.all.model <- auc.mod.model[,c("tpr", "fpr")] %>%
+  add_row(tpr = 0, fpr = 0, .before = T) %>%
+  add_row(tpr = 0, fpr = 0, .before = F)
+
+auc.all.model$model <- "h2o_model"
+
+banner("glmnet new model")
+
+## glmnet new model
+
+perfValidationNew <- perf.glmnet(pred = ImputedValidationNew$prediction, 
+                                 truth = ImputedValidationNew$Disease_status,
+                                 predClass = ImputedDataValidation$predictionClass,
+                                 prevalence = 1.95/100)
+
+perf.roc <- perfValidationNew$roc
+perf.avg <- perf.roc
+
+alpha.values.list <- unlist(perf.avg@alpha.values)
+alpha.values.list[mapply(is.infinite, alpha.values.list)] <- 0
+
+alpha.values <- rev(seq(min(alpha.values.list), max(alpha.values.list), length = max(sapply(perf.avg@alpha.values,
+                                                                                            length))))
+for (i in 1:length(perf.avg@y.values)) {
+  perf.avg@x.values[[i]] <- (stats::approxfun(perf.avg@alpha.values[[i]], perf.avg@x.values[[i]],
+                                              rule = 2, ties = mean))(alpha.values)
+  perf.avg@y.values[[i]] <- (stats::approxfun(perf.avg@alpha.values[[i]], perf.avg@y.values[[i]],
+                                              rule = 2, ties = mean))(alpha.values)
+}
+
+x <- c(rowMeans(data.frame(perf.avg@x.values)), 0)
+y <- c(rowMeans(data.frame(perf.avg@y.values)), 0)
+
+auc.new.model <- data.frame(fpr = x, tpr = y, model = "glmnet_new")
+
+colnames(auc.new.model) <- c("fpr", "tpr", "model")
+
+banner("glmnet old model")
+
+## glmnet old model
+
+perf.roc <- perfValidation$roc
+perf.avg <- perf.roc
+
+alpha.values.list <- unlist(perf.avg@alpha.values)
+alpha.values.list[mapply(is.infinite, alpha.values.list)] <- 0
+
+alpha.values <- rev(seq(min(alpha.values.list), max(alpha.values.list), length = max(sapply(perf.avg@alpha.values,
+                                                                                            length))))
+for (i in 1:length(perf.avg@y.values)) {
+  perf.avg@x.values[[i]] <- (stats::approxfun(perf.avg@alpha.values[[i]], perf.avg@x.values[[i]],
+                                              rule = 2, ties = mean))(alpha.values)
+  perf.avg@y.values[[i]] <- (stats::approxfun(perf.avg@alpha.values[[i]], perf.avg@y.values[[i]],
+                                              rule = 2, ties = mean))(alpha.values)
+}
+
+x <- c(rowMeans(data.frame(perf.avg@x.values)), 0)
+y <- c(rowMeans(data.frame(perf.avg@y.values)), 0)
+
+auc.old.model <- data.frame(fpr = x, tpr = y, model = "glmnet_old")
+
+colnames(auc.new.model) <- c("fpr", "tpr", "model")
+
+### merge all models df
+list.df <- list(auc.all.model, auc.new.model, auc.old.model)
+
+df <- do.call(rbind, list.df)
+
+## plot ROC
+col <- RColorBrewer::brewer.pal(length(unique(df$model)), "Set1")
+plot <- ggplot(df,
+               aes(x=fpr,
+                   y=tpr,
+                   color=model)) +
+  geom_line(size=2) +
+  theme_bw() +
+  theme(
+    axis.line = element_line(size = 0.75),
+    axis.text = element_text(
+      size = 11,
+      face = "bold",
+      colour = "black"
+    ),
+    axis.title = element_text(size = 12, face = "bold")
+  ) +
+  scale_color_manual(values = col) +
+  theme(legend.position = c(0.8, 0.1),
+        legend.background = element_blank(),
+        legend.text = element_text(size= 12, face="bold"),
+        legend.title = element_blank()) +
+  labs(x="False Positive Rate",
+       y="True Positive Rate")
+
+print(plot)
+
+save_plot("./svg/ROC_validation_all models.svg", 
+          fig = plot, 
+          width = 15, 
+          height = 10, 
+          dpi = 300)
+```
+
+### pROC stats
+
+```{r}
+roc.glmnet_old <- roc(response = ImputedDataValidation$Disease_short, 
+                      predictor = ImputedDataValidation$prediction)
+
+banner("old vs new glmnet")
+roc.test(roc.glmnet_new, roc.glmnet_old,
+         method = "bootstrap", 
+         boot.n = 1000, 
+         progress = "none", 
+         paired = F)
+
+banner("old vs h2o")
+roc.test(roc.mod, roc.glmnet_old,
+         method = "bootstrap", 
+         boot.n = 1000, 
+         progress = "none", 
+         paired = F)
+
+banner("h2o vs new glmnet")
+roc.test(roc.glmnet_new, roc.mod,
+         method = "bootstrap", 
+         boot.n = 1000, 
+         progress = "none", 
+         paired = F)
+```
+
+## alluvial plots
+
+```{r}
+old.model <- ImputedDataValidation[, colnames(ImputedDataValidation) %in% c("EXTERNAL_REFERENCE", "Disease_short", "predictionClass")]
+old.model$EXTERNAL_REFERENCE <- gsub("-.*", "", old.model$EXTERNAL_REFERENCE)
+names(old.model)[names(old.model) == 'Disease_short'] <- 'Disease_status'
+old.model$model <- "glmnet_old"
+
+new.model <- ImputedValidationNew[, colnames(ImputedValidationNew) %in% c("EXTERNAL_REFERENCE", "Disease_status", "predictionClass")]
+new.model$EXTERNAL_REFERENCE <- gsub("_4", "", new.model$EXTERNAL_REFERENCE)
+new.model$model <- "glmnet_new"
+
+pred.h2o <- h2o.predict(mod.model, validation)
+validation$predictionClass <- as.character(pred.h2o$predict)
+
+h2o.model <- as.data.frame(validation[, colnames(validation) %in% c("EXTERNAL_REFERENCE", "Disease_status", "predictionClass")])
+h2o.model$EXTERNAL_REFERENCE <- gsub("_4", "", h2o.model$EXTERNAL_REFERENCE)
+h2o.model$model <- "h2o_model"
+
+## merge data
+### merge all models df
+list.df <- list(old.model, new.model, h2o.model)
+df <- do.call(rbind, list.df)
+
+df1 <- df[, colnames(df) %in% c("EXTERNAL_REFERENCE", "Disease_status")]
+df1 <- df1[!duplicated(df1),]
+df1$model <- "Actual"
+names(df1)[names(df1) == 'Disease_status'] <- 'predictionClass'
+
+df2 <- df[, !colnames(df) %in% "Disease_status"]
+
+merged.df <- rbind(df1, df2)
+
+merged.df$model <- factor(merged.df$model, levels =c("Actual", "glmnet_old", "glmnet_new", "h2o_model"))
+
+p <- ggplot(merged.df,
+            aes(x = model, stratum = predictionClass, alluvium = EXTERNAL_REFERENCE,
+                fill = predictionClass, label = predictionClass)) +
+  scale_x_discrete(expand = c(.1, .1)) +
+  geom_flow() +
+  geom_stratum(alpha = .5) +
+  geom_text(stat = "stratum", size = 3) +
+  theme(legend.position = "none") +
+  ggtitle("Comparisons of prediction of different models") +
+  xlab("") +
+  scale_fill_manual(values = brewer.pal(2, "Set1")) +
+  ggplot_theme
+
+print(p)
+
+save_plot("./svg/alluvial_all models.svg", 
+          fig = p, 
+          width = 20, 
+          height = 10, 
+          dpi = 300)
+
+## old
+p <- ggplot(merged.df[merged.df$model %in% c("Actual","glmnet_old"),],
+            aes(x = model, stratum = predictionClass, alluvium = EXTERNAL_REFERENCE,
+                fill = predictionClass, label = predictionClass)) +
+  scale_x_discrete(expand = c(.1, .1)) +
+  geom_flow() +
+  geom_stratum(alpha = .5) +
+  geom_text(stat = "stratum", size = 3) +
+  theme(legend.position = "none") +
+  ggtitle("Comparisons of prediction of different models") +
+  xlab("") +
+  scale_fill_manual(values = brewer.pal(2, "Set1")) +
+  ggplot_theme
+
+print(p)
+
+save_plot("./svg/alluvial_old_models.svg", 
+          fig = p, 
+          width = 12, 
+          height = 10, 
+          dpi = 300)
+
+# new
+p <- ggplot(merged.df[merged.df$model %in% c("Actual","glmnet_new"),],
+            aes(x = model, stratum = predictionClass, alluvium = EXTERNAL_REFERENCE,
+                fill = predictionClass, label = predictionClass)) +
+  scale_x_discrete(expand = c(.1, .1)) +
+  geom_flow() +
+  geom_stratum(alpha = .5) +
+  geom_text(stat = "stratum", size = 3) +
+  theme(legend.position = "none") +
+  ggtitle("Comparisons of prediction of different models") +
+  xlab("") +
+  scale_fill_manual(values = brewer.pal(2, "Set1")) +
+  ggplot_theme
+
+print(p)
+
+save_plot("./svg/alluvial_new_models.svg", 
+          fig = p, 
+          width = 12, 
+          height = 10, 
+          dpi = 300)
+
+# h2o
+p <- ggplot(merged.df[merged.df$model %in% c("Actual","h2o_model"),],
+            aes(x = model, stratum = predictionClass, alluvium = EXTERNAL_REFERENCE,
+                fill = predictionClass, label = predictionClass)) +
+  scale_x_discrete(expand = c(.1, .1)) +
+  geom_flow() +
+  geom_stratum(alpha = .5) +
+  geom_text(stat = "stratum", size = 3) +
+  theme(legend.position = "none") +
+  ggtitle("Comparisons of prediction of different models") +
+  xlab("") +
+  scale_fill_manual(values = brewer.pal(2, "Set1")) +
+  ggplot_theme
+
+print(p)
+
+save_plot("./svg/alluvial_h2o_models.svg", 
+          fig = p, 
+          width = 12, 
+          height = 10, 
+          dpi = 300)
+```
+
+# computing environment
+
+```{r}
+sessionInfo()
+```

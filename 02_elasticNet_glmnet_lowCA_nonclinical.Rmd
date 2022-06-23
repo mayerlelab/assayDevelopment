@@ -1,0 +1,488 @@
+---
+title: "assay developement"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+   html_notebook:
+    theme: united
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: true
+subtitle: "__Elastic Net variable selection (CA19.9 <37)__"
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics=TRUE, ind=1)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=85),tidy=TRUE, echo=TRUE, warning=FALSE, message=FALSE)
+```
+
+# load packages and datasets
+
+```{r packages}
+rm(list = ls())
+
+# load packages ---------------------------------------------------
+scriptLibraries <-  c(
+ "glmnet", 
+ "doParallel", 
+ "doMC",
+ "foreach", 
+ "ROCR",
+ "caret",
+ "broom",
+ "scales",
+ "ggplot2",
+ "sjPlot",
+ "here"
+)
+##---------------------------------------------------------------
+##                      load functions                         --
+##---------------------------------------------------------------
+source("~/r_functions/basicFunctions.R")
+source("~/r_functions/ImputeTransformScale.R")
+source("~/r_functions/cutOff.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+# ggplot theme --------------------------------------------------
+ggplot_theme <- theme_bw() +
+  theme(
+    axis.line = element_line(size = 0.75),
+    axis.text = element_text(
+      size = 11,
+      face = "bold",
+      colour = "black"
+    ),
+    axis.title = element_text(size = 12, face = "bold")
+  )
+
+```
+
+# load data
+
+```{r load}
+columnToDrop <- "X18100281"
+## train
+train <- read.table("./data/quant-ID_VD1_VD2/MxP_Pancreas_Panel_gamma_version_id_data.txt", 
+                    sep = "\t",
+                    header = TRUE)
+train <- train[!train$Diagnosis %in% "Pancreatic cancer and chronic pancreatitis",]
+train$Disease_status <- ifelse(train$PDCA == "yes", "PDAC", "CP")
+train$lowCA <- ifelse(train$CA19_9 < 2, "low", "high")
+train$lowCA_clinical <- ifelse(train$CA19_9 < 37, "low", "high")
+train <- train[,!colnames(train) %in% columnToDrop]
+
+train$predictionClassCa19.9 <- ifelse(train$CA19_9 < 37,
+                                       "CP", "PDAC")
+## test
+test <- read.table("./data/quant-ID_VD1_VD2/MxP_Pancreas_Panel_gamma_version_vd1_data.txt", 
+                    sep = "\t",
+                    header = TRUE)
+test$Disease_status <- ifelse(test$PDCA == "yes", "PDAC", "CP")
+test$lowCA <- ifelse(test$CA19_9 < 2, "low", "high")
+test$lowCA_clinical <- ifelse(test$CA19_9 < 37, "low", "high")
+test <- test[,!colnames(test) %in% columnToDrop]
+
+test$predictionClassCa19.9 <- ifelse(test$CA19_9 < 37,
+                                       "CP", "PDAC")
+## validation
+validation <- read.table("./data/quant-ID_VD1_VD2/MxP_Pancreas_Panel_gamma_version_vd2_data.tsv", 
+                    sep = "\t",
+                    header = TRUE)
+# validation <- validation[!validation$Diagnosis %in% "Non-pancreatic control",]
+validation$Disease_status <- ifelse(validation$Diagnosis == "Pancreatic cancer", "PDAC", "CP")
+validation$lowCA <- ifelse(validation$CA19_9 < 2, "low", "high")
+validation$lowCA_clinical <- ifelse(validation$CA19_9 < 37, "low", "high")
+validation <- validation[,!colnames(validation) %in% columnToDrop]
+
+validation$predictionClassCa19.9 <- ifelse(validation$CA19_9 < 37,
+                                       "CP", "PDAC")
+# load metabolite names ---------------------------------------------------
+metaboliteNames <- 
+ read.csv("./masterTable/masterTableMetaboliteNames.csv",
+          stringsAsFactors = FALSE)
+```
+
+## create folders
+
+```{r}
+## ml.dataset
+ifelse(!dir.exists(file.path(paste0(here()), "ml_dataset")),
+dir.create(file.path(paste0(here()), "ml_dataset")), FALSE)
+## glmnet.models
+ifelse(!dir.exists(file.path(paste0(here()), "glmnet_models")),
+dir.create(file.path(paste0(here()), "glmnet_models")), FALSE)
+```
+
+## define response and features
+
+```{r response}
+# define response variable -----------------------------------------------
+response <- "Disease_status"
+
+## define train factors
+train[[response]] <- as.factor(train[[response]])
+train <- train[!train$lowCA_clinical %in% "high", ]
+## define test factors  
+test[[response]] <- as.factor(test[[response]])
+test <- test[!test$lowCA_clinical %in% "high", ]
+## define validation factors
+validation[[response]] <- as.factor(validation[[response]])
+validation <- validation[!validation$lowCA_clinical %in% "high", ]
+
+# define features --------------------------------------------------------
+features <-
+ setdiff(colnames(train)[grepl("^X|Disease_status", colnames(train))], response)
+```
+
+## impute missing data and transform data
+
+```{r impute}
+## imupte train
+dropvariables <- colnames(train)[!grepl("^X|CA19_9",colnames(train))]
+ImputedTrain <- ImputeTransformScale(train, 
+                                     Impute= TRUE,
+                                     Transform = TRUE,
+                                     Scaling = TRUE,
+                                     ScaleType = "Auto",
+                                     drop.variables=dropvariables)
+saveRDS(ImputedTrain, "./ml_dataset/ImputedTrain_lewis_nonclinical.rds")
+## imupte test
+dropvariables <- colnames(test)[!grepl("^X|CA19_9",colnames(test))]
+ImputedTestComplete <- ImputeTransformScale(test, 
+                                     Impute= TRUE,
+                                     Transform = TRUE,
+                                     Scaling = TRUE,
+                                     ScaleType = "Auto",
+                                     drop.variables=dropvariables)
+saveRDS(ImputedTestComplete, "./ml_dataset/ImputedTest_lewis_nonclinical.rds")
+ImputedTest <- ImputedTestComplete[!ImputedTestComplete$Diagnosis %in% "Non-pancreatic control",]
+## imupte Validation
+dropvariables <- colnames(validation)[!grepl("^X|CA19_9",colnames(validation))]
+ImputedValidationComplete <- ImputeTransformScale(validation, 
+                                     Impute= TRUE,
+                                     Transform = TRUE,
+                                     Scaling = TRUE,
+                                     ScaleType = "Auto",
+                                     drop.variables=dropvariables)
+saveRDS(ImputedValidationComplete, "./ml_dataset/ImputedValidation_lewis_nonclinical.rds")
+ImputedValidation<- ImputedValidationComplete[!ImputedValidationComplete$Diagnosis %in% "Non-pancreatic control",]
+```
+
+# elastic net
+
+## data preparation
+
+```{r net data}
+## train dataset
+trainX<- as.matrix(ImputedTrain[,colnames(ImputedTrain) %in% features])
+# trainXCa19.9 <- as.matrix(cbind(0, CA19_9=ImputedTrain[,colnames(ImputedTrain) %in% "CA19_9"]))
+#trainXCa19.9 <- data.frame(CA19.9_class=as.factor(ifelse(train$CA19_9 <37, "CP", "PDAC")))
+#trainXCa19.9 <- sparse.model.matrix(~.-1, trainXCa19.9)
+trainY <- as.matrix(ImputedTrain[,colnames(ImputedTrain) %in% response])
+
+## test dataset
+testX <- as.matrix(ImputedTest[,colnames(ImputedTest) %in% features])
+# testXCa19.9 <- as.matrix(cbind(0, CA19_9=ImputedTest[,colnames(ImputedTest) %in% "CA19_9"]))
+# testXCa19.9 <- data.frame(CA19.9_class=as.factor(ifelse(test[!test$Diagnosis %in% "Non-pancreatic control",]$CA19_9 <37, "CP", "PDAC")))
+# testXCa19.9 <- sparse.model.matrix(~.-1, testXCa19.9)
+testY <- as.matrix(ImputedTest[,colnames(ImputedTest) %in% response])
+
+## validation dataset
+validationX <- as.matrix(ImputedValidation[,colnames(ImputedValidation) %in% features])
+# validationXCa19.9 <- as.matrix(cbind(0, CA19_9=ImputedValidation[,colnames(ImputedValidation) %in% "CA19_9"]))
+# validationXCa19.9 <- data.frame(CA19.9_class=as.factor(ifelse(validation[!validation$Diagnosis %in% "Non-pancreatic control",]$CA19_9 <37, "CP", "PDAC")))
+# validationXCa19.9 <- sparse.model.matrix(~.-1, validationXCa19.9)
+validationY <- as.matrix(ImputedValidation[,colnames(ImputedValidation) %in% response])
+
+```
+
+## grid search
+
+```{r grid}
+set.seed(123456789)
+## Elastic net with 0 < alpha < 1
+a <- seq(0.1, 0.9, 0.01)
+
+numberOfCores <- parallel::detectCores(all.tests = TRUE) - 1
+
+## search grid
+if(Sys.info()["sysname"]=="Windows"){
+ cl<-makeCluster(numberOfCores)
+ registerDoParallel(cl)
+}else{
+ registerDoMC(numberOfCores)
+}
+
+if (file.exists("./glmnet_models/mfit_lewis_nonclinical.RData")) { load("./glmnet_models/mfit_lewis_nonclinical.RData") 
+  } else {
+    search <- foreach(i = a, .combine = rbind) %dopar% {
+      cv <- cv.glmnet(x = validationX,
+                 y = validationY,
+                 family = "binomial",
+                 nfold = 10,
+                 type.measure = "deviance",
+                 parallel = TRUE,
+                 standardize=FALSE,
+                 alpha = i)
+ data.frame(cvm = cv$cvm[cv$lambda == cv$lambda.1se],
+            lambda.1se = cv$lambda.1se,
+            alpha = i)
+}
+## best tuning parameters
+cvIndex <- search[search$cvm == min(search$cvm), ]
+cvIndex
+
+## final model
+mfit_lewis_nonclinical <-glmnet(validationX,
+             validationY,
+             family = "binomial",
+             nfold = 10,
+             type.measure = "deviance",
+             parallel = TRUE,
+             standardize=TRUE,
+             alpha = cvIndex$alpha,
+             lambda =  cvIndex$lambda.1se,
+             keep = TRUE)
+# Save model
+save(mfit_lewis_nonclinical, file="./glmnet_models/mfit_lewis_nonclinical.RData")
+}
+
+## coefficients
+coef <- coef(mfit_lewis_nonclinical)
+coefDF <- as.data.frame(as.matrix(coef))
+
+# metabolite ID to metabolite names 
+rownames(coefDF) <- gsub("^X", "", rownames(coefDF))
+matchColumnNames <-
+  match(rownames(coefDF), metaboliteNames$ID, nomatch = 0)
+rownames(coefDF)[rownames(coefDF) %in% metaboliteNames$ID] <-
+  metaboliteNames$METABOLITE_NAME[matchColumnNames]
+colnames(coefDF) <- "coefficient"
+coefDF$varImp <- ifelse(coefDF$coefficient %in% 0, "*", "")
+
+## coef print
+tab_df(coefDF, show.rownames = TRUE, digits = 3)
+```
+
+## model prediction
+
+```{r pred}
+## validation prediction
+ImputedValidation$prediction = predict(mfit_lewis_nonclinical, 
+                                  newx = validationX, 
+                                  s = mfit_lewis_nonclinical$lambda,
+                                  type="response")
+```
+
+## cutoff
+
+```{r cutoff}
+accuracy_info <- AccuracyCutoffInfo(train = ImputedValidation, 
+                                    test = ImputedValidation,
+                                    predict = "prediction", 
+                                    actual = response,
+                                    PositiveGroup = "PDAC",
+                                    NegativeGroup = "CP")
+# define the theme for the next plot
+p <- accuracy_info$plot
+## print
+print(p)
+```
+
+## roc
+
+```{r roc cost}
+cost_fp <- 1
+cost_fn <- 2
+roc_info <- ROCInfo( data = ImputedValidation,
+                     predict = "prediction", 
+                     actual = response, 
+                     cost.fp = cost_fp, 
+                     cost.fn = cost_fn,
+                     PositiveGroup = "PDAC",
+                     NegativeGroup = "CP")
+grid.draw(roc_info$plot)
+
+banner("cutoff")
+print(roc_info$cutoff)
+```
+
+## cutoff based on roc
+
+```{r roc cutoff}
+cm_info <- ConfusionMatrixInfo( data = ImputedValidation, 
+                                predict = "prediction", 
+                                actual = response, 
+                                cutoff = roc_info$cutoff,
+                                PositiveGroup = "PDAC",
+                                NegativeGroup = "CP")
+p <- cm_info$plot
+## print
+print(p)
+```
+
+## calculate confusionMatrix
+
+```{r cm}
+#### model
+ImputedValidation$predictionClass <- ifelse(ImputedValidation$prediction < roc_info$cutoff,
+                                            "CP", "PDAC")
+banner("validation")
+confusionMatrix(ImputedValidation$Disease_status,
+                as.factor(ImputedValidation$predictionClass),
+                positive = "PDAC",
+                prevalence = 1.95/100)
+```
+
+## auc
+
+### function
+
+```{r auc}
+perf.glmnet <- function(truth, pred, predClass, boot.n = 1000, prevalence) {
+  reps <- boot.n
+  predClass <- as.factor(predClass)
+  boot.pred <- matrix(0, nrow = length(truth), ncol = reps)
+  boot.predClass <- matrix(0, nrow = length(truth), ncol = reps)
+  boot.truth <- matrix(0, nrow = length(truth), ncol = reps)
+  for (rep in 1:reps) {
+    bootstrap_indices <- sample(1:length(truth), length(truth), replace = TRUE)
+    boot.pred[, rep] <- pred[bootstrap_indices]
+    boot.predClass[, rep] <- predClass[bootstrap_indices]
+    boot.truth[, rep] <- truth[bootstrap_indices]
+  }
+  
+  pred.obj <- prediction(boot.pred, boot.truth)
+  acc <- performance(pred.obj, measure = "acc")
+  
+  cmResults <- data.frame()
+  
+  for (i in 1:ncol(boot.truth)) {
+    cm <- confusionMatrix(as.factor(boot.truth[,i]), 
+                          as.factor(boot.predClass[,i]), 
+                          prevalence = prevalence)
+    
+    cmResults[i, "accuracy"] = cm$overall['Accuracy']
+    cmResults[i, "specificity"] = cm$byClass["Specificity"]
+    cmResults[i,"sensitivity"] = cm$byClass["Sensitivity"]
+    cmResults[i, "ppv"] = cm$byClass["Pos Pred Value"]
+    cmResults[i, "npv"] = cm$byClass["Neg Pred Value"]
+    
+  }
+  
+  perf <- list(pred = pred, 
+               truth = truth, 
+               roc = performance(pred.obj, measure = "tpr",x.measure = "fpr"), 
+               auc = performance(pred.obj, measure = "auc"), 
+               acc = performance(pred.obj,
+                                 measure = "acc"),
+               cmResults = cmResults
+               )
+  invisible(perf)
+  
+}
+```
+
+### auc 95%CI
+
+```{r}
+banner("model performance validation")
+perfValidation <- perf.glmnet(pred = ImputedValidation$prediction, 
+                         truth =ImputedValidation$Disease_status,
+                         predClass = ImputedValidation$predictionClass,
+                         prevalence = 1.95/100)
+banner("AUC and other matrices")
+Rmisc::CI(as.numeric(perfValidation$auc@y.values), ci=.95)
+sapply(perfValidation$cmResults, Rmisc::CI)
+```
+
+## exploratory roc curves
+
+```{r roc}
+plotROC <- function(model.list,model.names) {
+  df <- data.frame()
+  auc <- list()
+  for (l in 1:length(model.list)) {
+    perf.roc <- model.list[[l]]$roc
+    perf.avg <- perf.roc
+    alpha.values.list <- unlist(perf.avg@alpha.values)
+    alpha.values.list[mapply(is.infinite, alpha.values.list)] <- 0
+    
+    alpha.values <- rev(seq(min(alpha.values.list),
+                            max(alpha.values.list),
+                            length=max(sapply(perf.avg@alpha.values, length))))
+    for (i in 1:length(perf.avg@y.values)) {
+      perf.avg@x.values[[i]] <-
+        stats::approxfun(perf.avg@alpha.values[[i]],perf.avg@x.values[[i]],
+                         rule=2, ties=mean)(alpha.values)
+      perf.avg@y.values[[i]] <-
+        stats::approxfun(perf.avg@alpha.values[[i]], perf.avg@y.values[[i]],
+                         rule=2, ties=mean)(alpha.values)
+    }
+    
+    x <- c(rowMeans(data.frame(perf.avg@x.values)),0)
+    y <- c(rowMeans(data.frame(perf.avg@y.values)),0)
+    
+    df_unique <- data.frame(fpr=x,
+                            tpr=y,
+                            model=model.names[l])
+    colnames(df_unique) <- c("fpr", "tpr", "model")
+    
+    df <- rbind(df, df_unique)
+    
+    ## auc
+    auc[[model.names[l]]] <- Rmisc::CI(as.numeric(model.list[[l]]$auc@y.values), ci=.95)
+  }
+  
+  col <- RColorBrewer::brewer.pal(length(unique(df$model)), "Set1")
+  plot <- ggplot(df,
+                 aes(x=fpr,
+                     y=tpr,
+                     color=model)) +
+    geom_line(size=2) +
+    theme_bw() +
+    theme(
+      axis.line = element_line(size = 0.75),
+      axis.text = element_text(
+        size = 11,
+        face = "bold",
+        colour = "black"
+      ),
+      axis.title = element_text(size = 12, face = "bold")
+    ) +
+    scale_color_manual(values = col) +
+    theme(legend.position = c(0.8, 0.1),
+          legend.background = element_blank(),
+          legend.text = element_text(size= 12, face="bold"),
+          legend.title = element_blank()) +
+    labs(x="False Positive Rate",
+         y="True Positive Rate")
+}
+
+##----------------------------------------------------------------
+##                        train set (ID)                        --
+##----------------------------------------------------------------
+model.names <- c("Biomarker signature")
+model.list <- list(perfValidation)
+p <- plotROC(model.list, model.names) + ggtitle("VD2 set")
+## print
+print(p)
+## save results
+save_plot(
+    paste0("./svg/glmnet_auc_validation_lewis.svg"),
+    fig = p,
+    width = 15,
+    height = 15,
+    dpi = 300
+  )
+
+```
+
+# computing environment
+
+```{r}
+sessionInfo()
+```
